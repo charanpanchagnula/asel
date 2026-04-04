@@ -8,7 +8,7 @@ class ExecutionEnvironment:
     """Wraps a Docker container for running build and scan commands."""
 
     def __init__(self, repo_path: Path, image: str):
-        self.repo_path = repo_path
+        self.repo_path = repo_path.resolve()  # Docker requires absolute paths for volume mounts
         self.image = image
         self._client = docker.from_env()
         self._container = None
