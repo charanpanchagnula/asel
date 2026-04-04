@@ -105,7 +105,7 @@ class GitleaksScanner(BaseScanner):
         try:
             client = docker.from_env()
             output = client.containers.run(
-                "zricethezav/gitleaks:latest",
+                "ghcr.io/gitleaks/gitleaks:latest",
                 command=["detect", "--source", "/path", "--report-format", "json",
                          "--report-path", "/dev/stdout", "--no-git"],
                 volumes={str(repo_path): {"bind": "/path", "mode": "ro"}},

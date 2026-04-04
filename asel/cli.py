@@ -2,7 +2,10 @@
 import logging
 from pathlib import Path
 
+from dotenv import load_dotenv
 import typer
+
+load_dotenv()
 from rich.console import Console
 
 from .models import RunConfig
