@@ -1,5 +1,6 @@
 # asel/pipeline.py
 import logging
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -175,6 +176,7 @@ class PipelineOrchestrator:
         prev_ids = [f.id for f in prev_findings]
 
         logger.info("[ASEL] Remediation iteration %d...", iteration)
+        self._snapshot_repo(repo_path)
         remediation_agent.run(self._remediation_prompt(prev_findings, iteration))
 
         # Rebuild
@@ -183,7 +185,8 @@ class PipelineOrchestrator:
         self._save_build_log(build_result, f"remediation-{iteration}", run_dir)
 
         if not build_result.success:
-            logger.warning("[ASEL] Patch broke the build — rejecting")
+            logger.warning("[ASEL] Patch broke the build — rolling back")
+            self._rollback_repo(repo_path)
             patch = PatchAttempt(
                 iteration=iteration,
                 target=PatchTarget.FINDING_REMEDIATION,
@@ -207,23 +210,29 @@ class PipelineOrchestrator:
         new_ids = [f.id for f in new_findings]
         delta = len(prev_findings) - len(new_findings)
         introduced = any(fid not in prev_ids for fid in new_ids)
+        net_negative = introduced and delta < 0
 
         logger.info("[ASEL] Iteration %d: delta=%+d, introduced_new=%s", iteration, delta, introduced)
+
+        if net_negative:
+            logger.warning("[ASEL] Patch introduced new findings with net-negative delta — rolling back")
+            self._rollback_repo(repo_path)
 
         patch = PatchAttempt(
             iteration=iteration,
             target=PatchTarget.FINDING_REMEDIATION,
             build_result_after=build_result,
-            succeeded=delta > 0 and not (introduced and delta < 0),
+            succeeded=delta > 0 and not net_negative,
             findings_before=prev_ids,
-            findings_after=new_ids,
-            delta=delta,
+            findings_after=prev_ids if net_negative else new_ids,
+            delta=0 if net_negative else delta,
             introduced_new_findings=introduced,
         )
-        state.findings = new_findings
+        # Only advance the finding set if the patch was not net-negative
+        state.findings = prev_findings if net_negative else new_findings
         snapshot = IterationSnapshot(
             iteration=iteration,
-            findings=new_findings,
+            findings=state.findings,
             build_result=build_result,
             patch_attempt=patch,
         )
@@ -258,6 +267,24 @@ class PipelineOrchestrator:
         for f in findings:
             counts[f.severity.value] = counts.get(f.severity.value, 0) + 1
         return counts
+
+    def _snapshot_repo(self, repo_path: Path) -> None:
+        """Stage all current changes so we can restore to this point if a patch is rejected."""
+        subprocess.run(["git", "add", "-A"], cwd=repo_path, capture_output=True)
+        # Commit only if there are staged changes (i.e. agent made edits)
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=repo_path, capture_output=True
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                ["git", "commit", "-m", "asel: pre-patch snapshot", "--no-gpg-sign"],
+                cwd=repo_path, capture_output=True,
+            )
+
+    def _rollback_repo(self, repo_path: Path) -> None:
+        """Discard any uncommitted changes made by the agent."""
+        subprocess.run(["git", "checkout", "."], cwd=repo_path, capture_output=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=repo_path, capture_output=True)
 
     def _save(self, state: RunState, run_dir: Path) -> None:
         (run_dir / "run-state.json").write_text(state.model_dump_json(indent=2))
