@@ -1,4 +1,5 @@
 # asel/agents.py
+import shlex
 from pathlib import Path
 
 from agno.agent import Agent
@@ -61,7 +62,7 @@ def create_build_agent(
     @tool
     def run_maven(args: str) -> str:
         """Run Maven inside the build container. Pass args as a space-separated string, e.g. 'clean install -DskipTests'."""
-        exit_code, output = env.run(["mvn"] + args.split())
+        exit_code, output = env.run(["mvn"] + shlex.split(args))
         return output
 
     @tool

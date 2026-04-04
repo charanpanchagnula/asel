@@ -37,6 +37,7 @@ class SemgrepScanner(BaseScanner):
                 command=["semgrep", "scan", "--config=auto", "--json", "/src"],
                 volumes={str(repo_path): {"bind": "/src", "mode": "ro"}},
                 remove=True,
+                stderr=False,
             )
             data = json.loads(output)
             return [self._parse(r) for r in data.get("results", [])]
@@ -69,6 +70,7 @@ class TrivyScanner(BaseScanner):
                 command=["fs", "--format", "json", "/workspace"],
                 volumes={str(repo_path): {"bind": "/workspace", "mode": "ro"}},
                 remove=True,
+                stderr=False,
             )
             data = json.loads(output)
             findings = []
@@ -108,6 +110,7 @@ class GitleaksScanner(BaseScanner):
                          "--report-path", "/dev/stdout", "--no-git"],
                 volumes={str(repo_path): {"bind": "/path", "mode": "ro"}},
                 remove=True,
+                stderr=False,
             )
             data = json.loads(output)
             return [self._parse(r) for r in (data if isinstance(data, list) else [])]

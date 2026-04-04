@@ -97,8 +97,9 @@ class PipelineOrchestrator:
             )
             controller = IterationController(self._config)
             controller.start()
+            effective_max = controller.effective_max_iterations(len(findings))
 
-            for iteration in range(1, self._config.max_remediation_iterations + 1):
+            for iteration in range(1, effective_max + 1):
                 state = self._remediation_iteration(
                     state, iteration, env, remediation_agent, scanner, repo_path, run_dir
                 )
@@ -110,7 +111,8 @@ class PipelineOrchestrator:
 
         except Exception as e:
             logger.exception("[ASEL] Unexpected error: %s", e)
-            state.status = RunStatus.BUILD_FAILED
+            if state.status == RunStatus.RUNNING:
+                state.status = RunStatus.BUILD_FAILED
         finally:
             if env:
                 env.stop()
@@ -206,13 +208,13 @@ class PipelineOrchestrator:
         delta = len(prev_findings) - len(new_findings)
         introduced = any(fid not in prev_ids for fid in new_ids)
 
-        logger.info("[ASEL] Iteration %d: delta=%+d, introduced_new=%s", iteration, -delta, introduced)
+        logger.info("[ASEL] Iteration %d: delta=%+d, introduced_new=%s", iteration, delta, introduced)
 
         patch = PatchAttempt(
             iteration=iteration,
             target=PatchTarget.FINDING_REMEDIATION,
             build_result_after=build_result,
-            succeeded=delta > 0 and not introduced,
+            succeeded=delta > 0 and not (introduced and delta < 0),
             findings_before=prev_ids,
             findings_after=new_ids,
             delta=delta,

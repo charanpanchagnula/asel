@@ -32,6 +32,8 @@ class IterationController:
         """
         if self._start_time is None:
             raise RuntimeError("Call start() before decide()")
+        if not snapshots:
+            raise RuntimeError("decide() called with no snapshots")
 
         # 1. Timeout check
         elapsed_minutes = (datetime.now(timezone.utc) - self._start_time).total_seconds() / 60
