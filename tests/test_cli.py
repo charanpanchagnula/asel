@@ -17,7 +17,7 @@ def test_cli_run_invokes_orchestrator():
     )
     with patch("asel.cli.PipelineOrchestrator") as mock_cls:
         mock_cls.return_value.run.return_value = mock_state
-        result = runner.invoke(app, ["run", "https://github.com/x/y"])
+        result = runner.invoke(app, ["https://github.com/x/y"])
     assert result.exit_code == 0
     mock_cls.return_value.run.assert_called_once()
 
@@ -31,5 +31,5 @@ def test_cli_exits_nonzero_on_build_failure():
     )
     with patch("asel.cli.PipelineOrchestrator") as mock_cls:
         mock_cls.return_value.run.return_value = mock_state
-        result = runner.invoke(app, ["run", "https://github.com/x/y"])
+        result = runner.invoke(app, ["https://github.com/x/y"])
     assert result.exit_code == 1
