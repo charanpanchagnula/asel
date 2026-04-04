@@ -39,11 +39,13 @@ asel run <repo-url> [OPTIONS]
 
 Options:
   --max-build-attempts     INT   Max build stabilization attempts [default: 5]
-  --max-remediation-iters  INT   Max patch/re-scan iterations [default: 3]
+  --max-remediation-iters  INT   Hard ceiling on remediation iterations [default: 10]
+  --stall-threshold        INT   Stop after N zero-delta iterations [default: 2]
+  --max-runtime-minutes    INT   Wall clock limit for entire run [default: 60]
   --scanners               LIST  Scanners to enable [default: semgrep,trivy,gitleaks]
   --output-dir             PATH  Where to write run artifacts [default: ./asel-runs]
-  --model                  STR   LLM model identifier [default: claude-3-5-sonnet]
-  --provider               STR   LLM provider [default: anthropic]
+  --model                  STR   LLM model identifier [default: deepseek-chat]
+  --provider               STR   LLM provider [default: deepseek]
 ```
 
 **The CLI has no business logic.** It parses args, constructs `RunConfig`, calls `PipelineOrchestrator.run()`, and exits. This keeps the path clear for a future FastAPI server entry point that does the exact same thing via HTTP.
@@ -238,11 +240,33 @@ BuildAgent
 
 The agent sees exactly the same output a developer would see running Maven locally — no translation layer. Commands are passed as argument lists (not shell strings) to prevent injection.
 
-### 6.4 Context Discipline
+### 6.4 Iteration Termination Logic
+
+The `IterationController` uses four signals evaluated in priority order after each remediation iteration:
+
+```
+effective_max = min(max_remediation_iterations, max(3, finding_count // min_findings_per_iteration))
+
+after each iteration:
+  if delta < min_delta_to_continue → stall_count += 1
+  else                             → stall_count = 0
+
+  CONVERGE      if no actionable findings remain
+  STALL         if stall_count >= stall_threshold   (exit early, stop burning budget)
+  TIMEOUT       if elapsed_minutes >= max_runtime_minutes
+  MAX_ITERATIONS if iteration >= effective_max
+  CONTINUE      otherwise
+```
+
+**Why dynamic scaling matters:** a repo with 30 findings needs more iterations than one with 3. Static limits either waste budget on simple repos or give up too early on complex ones. The effective max scales with the problem size while the hard ceiling prevents runaway runs.
+
+**Why stall detection matters:** the agent may genuinely be unable to fix remaining findings (e.g. a complex SAST pattern it doesn't understand). Stall detection exits cleanly rather than burning all remaining iterations producing zero-delta patches.
+
+### 6.5 Context Discipline
 
 Each agent invocation receives a **distilled, task-specific context** — never the full `RunState`. The `IterationController` is responsible for this filtering. Dumping full context degrades patch quality as iterations accumulate.
 
-### 6.5 Build Failure Categories (BuildAgent)
+### 6.6 Build Failure Categories (BuildAgent)
 
 | Category | Fix strategy |
 |---|---|
@@ -253,7 +277,7 @@ Each agent invocation receives a **distilled, task-specific context** — never 
 | `PLUGIN_INCOMPATIBILITY` | Update plugin version |
 | `TEST_FAILURE` | Retry with `-DskipTests` as last resort |
 
-### 6.6 Phase 2 Extension
+### 6.7 Phase 2 Extension
 
 ```
 RemediationAgent  →  RemediationTeam
@@ -273,13 +297,23 @@ All models are Pydantic. Serialized to JSON on disk. Schema is the source of tru
 ```python
 class RunConfig(BaseModel):
     repo_url: str
-    max_build_attempts: int = 5
-    max_remediation_iterations: int = 3
     enabled_scanners: list[ScannerType]
     output_dir: Path
     language: Language = Language.AUTO_DETECT
-    llm_model: str = "claude-3-5-sonnet"
-    llm_provider: str = "anthropic"
+    llm_model: str = "deepseek-chat"
+    llm_provider: str = "deepseek"
+
+    # Build stabilization
+    max_build_attempts: int = 5
+
+    # Remediation loop — termination is multi-signal, not just a counter
+    max_remediation_iterations: int = 10  # hard ceiling, never exceeded
+    min_findings_per_iteration: int = 3   # dynamic scale: effective_max = max(3, findings // this)
+    stall_threshold: int = 2              # stop after N consecutive iterations with insufficient delta
+    min_delta_to_continue: int = 1        # delta must reduce findings by at least this to not count as stall
+
+    # Safety net
+    max_runtime_minutes: int = 60         # wall clock limit for the entire run
 
 class BuildResult(BaseModel):
     success: bool
@@ -329,7 +363,7 @@ class RunState(BaseModel):
     iterations: list[IterationSnapshot]
     findings: list[ScanFinding] # current (latest iteration) findings
     final_finding_count: dict[Severity, int]
-    status: RunStatus           # RUNNING | CONVERGED | STALLED | MAX_ITERATIONS | BUILD_FAILED
+    status: RunStatus           # RUNNING | CONVERGED | STALLED | MAX_ITERATIONS | BUILD_FAILED | TIMEOUT
 ```
 
 ---
@@ -369,7 +403,7 @@ class RunState(BaseModel):
 | Data models | Pydantic |
 | Container management | docker-py |
 | Agent framework | Agno |
-| LLM (default) | Claude (Anthropic), provider-agnostic via Agno |
+| LLM (default) | DeepSeek (`deepseek-chat`), provider-agnostic via Agno — OpenAI and Anthropic available via `--provider` flag |
 | Scanners | Semgrep, Trivy, Gitleaks (Docker images) |
 
 ---
