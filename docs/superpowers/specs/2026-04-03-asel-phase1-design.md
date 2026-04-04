@@ -188,22 +188,61 @@ The `IterationController` is deterministic Python — loop counting, convergence
 **BuildAgent**
 - Invoked when a build attempt fails
 - Context: build logs (last 100 lines), current `pom.xml`, project structure, previous attempt summaries
-- Tools: `read_file`, `edit_file`
-- Goal: produce a `pom.xml` or config fix that unblocks the next build attempt
+- Goal: converge to a successful build through its own inner verification loop
 - Knows nothing about: scan findings
+
+Tools:
+
+| Tool | Purpose |
+|---|---|
+| `read_file(path)` | Read `pom.xml`, Maven settings, any config file |
+| `edit_file(path, old, new)` | Apply targeted edits to `pom.xml` or config files |
+| `list_directory(path)` | Explore multi-module project structure |
+| `run_maven(args)` | Run Maven inside the container — e.g. `dependency:resolve`, `compile -DskipTests`, `clean install` — captures stdout/stderr |
+| `get_dependency_versions(group_id, artifact_id)` | Query available versions from Maven Central (avoids guessing version strings) |
+
+`run_maven` is the critical tool. Without it the BuildAgent edits blindly and waits for the controller to validate — slow and wasteful. With it, the agent can edit `pom.xml` → run `mvn dependency:resolve` → read the output → edit again, all within a single agent invocation. The controller only sees the final result.
 
 **RemediationAgent**
 - Invoked each remediation iteration
 - Context: current findings (filtered to actionable severity), contents of affected files only
-- Tools: `read_file`, `edit_file`
 - Goal: fix the highest-impact finding(s) without breaking the build
 - Knows nothing about: build internals, previous iteration diffs (unless stalling)
 
-### 6.3 Context Discipline
+Tools:
+
+| Tool | Purpose |
+|---|---|
+| `read_file(path)` | Read source files referenced in findings |
+| `edit_file(path, old, new)` | Apply patch to source files |
+| `list_directory(path)` | Explore surrounding code for context (e.g. how a dep is used before upgrading) |
+| `run_maven_compile()` | Quick compile check — scoped to `mvn compile -DskipTests` only |
+| `search_cve(cve_id)` | Look up CVE details for richer remediation context (stubbed in Phase 1) |
+
+The `RemediationAgent` does not own rebuild + rescan validation — that stays in the Python `IterationController`. `run_maven_compile()` is an optional sanity check the agent can call before handing back to the controller for the full rebuild + rescan cycle.
+
+### 6.3 Tool Execution Model
+
+All `run_*` tools dispatch commands **inside the Docker container** via the `ExecutionEnvironment`, never directly on the host. Container isolation means agent-driven command execution carries no host-level risk.
+
+```
+BuildAgent
+    └── run_maven("dependency:resolve")
+            │
+            ▼
+        ExecutionEnvironment.run_in_container(["mvn", "dependency:resolve"])
+            │
+            ▼
+        Docker container → stdout/stderr → returned to agent
+```
+
+The agent sees exactly the same output a developer would see running Maven locally — no translation layer. Commands are passed as argument lists (not shell strings) to prevent injection.
+
+### 6.4 Context Discipline
 
 Each agent invocation receives a **distilled, task-specific context** — never the full `RunState`. The `IterationController` is responsible for this filtering. Dumping full context degrades patch quality as iterations accumulate.
 
-### 6.4 Build Failure Categories (BuildAgent)
+### 6.5 Build Failure Categories (BuildAgent)
 
 | Category | Fix strategy |
 |---|---|
@@ -214,7 +253,7 @@ Each agent invocation receives a **distilled, task-specific context** — never 
 | `PLUGIN_INCOMPATIBILITY` | Update plugin version |
 | `TEST_FAILURE` | Retry with `-DskipTests` as last resort |
 
-### 6.5 Phase 2 Extension
+### 6.6 Phase 2 Extension
 
 ```
 RemediationAgent  →  RemediationTeam
