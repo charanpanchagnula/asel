@@ -3,7 +3,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 import pytest
-from asel.ingestor import clone_repo, detect_language, detect_java_version, select_maven_image
+from asel.ingestor import (
+    clone_repo, detect_language, detect_java_version,
+    detect_java_version_gradle, select_maven_image, select_gradle_image, select_image,
+)
 from asel.models import Language
 
 
@@ -88,3 +91,60 @@ def test_detect_language_java_gradle_groovy_dsl(tmp_path):
 def test_detect_language_java_gradle_kotlin_dsl(tmp_path):
     (tmp_path / "build.gradle.kts").write_text('plugins { java }')
     assert detect_language(tmp_path) == Language.JAVA_GRADLE
+
+
+def test_detect_language_prefers_maven_when_both_present(tmp_path):
+    (tmp_path / "pom.xml").write_text("<project/>")
+    (tmp_path / "build.gradle").write_text("")
+    assert detect_language(tmp_path) == Language.JAVA_MAVEN
+
+
+def test_detect_java_version_gradle_source_compat(tmp_path):
+    (tmp_path / "build.gradle").write_text('sourceCompatibility = "17"')
+    assert detect_java_version_gradle(tmp_path) == 17
+
+
+def test_detect_java_version_gradle_java_version_enum(tmp_path):
+    (tmp_path / "build.gradle").write_text(
+        'java {\n    sourceCompatibility = JavaVersion.VERSION_21\n}'
+    )
+    assert detect_java_version_gradle(tmp_path) == 21
+
+
+def test_detect_java_version_gradle_kts(tmp_path):
+    (tmp_path / "build.gradle.kts").write_text(
+        'java {\n    sourceCompatibility = JavaVersion.VERSION_11\n}'
+    )
+    assert detect_java_version_gradle(tmp_path) == 11
+
+
+def test_detect_java_version_gradle_missing(tmp_path):
+    (tmp_path / "build.gradle").write_text('plugins { id "java" }')
+    assert detect_java_version_gradle(tmp_path) is None
+
+
+@pytest.mark.parametrize("java_ver,expected_tag", [
+    (8,  "jdk8"),
+    (11, "jdk11"),
+    (17, "jdk17"),
+    (21, "jdk21"),
+])
+def test_select_gradle_image_exact_match(tmp_path, java_ver, expected_tag):
+    (tmp_path / "build.gradle").write_text(f'sourceCompatibility = "{java_ver}"')
+    assert expected_tag in select_gradle_image(tmp_path)
+
+
+def test_select_gradle_image_unknown_version_uses_default(tmp_path):
+    (tmp_path / "build.gradle").write_text('plugins { id "java" }')
+    image = select_gradle_image(tmp_path)
+    assert "gradle:" in image
+
+
+def test_select_image_dispatches_to_maven(tmp_repo):
+    image = select_image(tmp_repo, Language.JAVA_MAVEN)
+    assert "maven:" in image
+
+
+def test_select_image_dispatches_to_gradle(tmp_gradle_repo):
+    image = select_image(tmp_gradle_repo, Language.JAVA_GRADLE)
+    assert "gradle:" in image
