@@ -148,3 +148,7 @@ def test_create_engine_returns_gradle_for_java_gradle(tmp_path):
     from asel.build import create_engine
     engine = create_engine(Language.JAVA_GRADLE, MagicMock(), tmp_path)
     assert isinstance(engine, GradleBuildEngine)
+
+
+def test_categorize_gradle_error_plugin():
+    assert categorize_gradle_error("Could not resolve plugin com.example:gradle-plugin:1.0") == ErrorCategory.PLUGIN_INCOMPATIBILITY

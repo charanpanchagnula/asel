@@ -10,6 +10,8 @@ from .models import BuildResult, BuildPhase, ErrorCategory
 def categorize_gradle_error(output: str) -> ErrorCategory:
     """Classify a Gradle build failure from its output."""
     lower = output.lower()
+    if "plugin" in lower and ("not found" in lower or "could not resolve" in lower):
+        return ErrorCategory.PLUGIN_INCOMPATIBILITY
     if "could not resolve" in lower or ("dependency" in lower and "not found" in lower):
         return ErrorCategory.DEPENDENCY_CONFLICT
     if "cannot find symbol" in lower or "compilation failed" in lower:
@@ -18,8 +20,6 @@ def categorize_gradle_error(output: str) -> ErrorCategory:
         return ErrorCategory.JAVA_VERSION_MISMATCH
     if "tests failed" in lower or ("test" in lower and "failed" in lower and "build failed" in lower):
         return ErrorCategory.TEST_FAILURE
-    if "plugin" in lower and ("not found" in lower or "could not resolve" in lower):
-        return ErrorCategory.PLUGIN_INCOMPATIBILITY
     return ErrorCategory.UNKNOWN
 
 
