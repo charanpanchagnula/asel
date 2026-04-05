@@ -32,16 +32,18 @@ def test_full_pipeline_produces_run_state(tmp_path):
     )
     mock_run_output = MagicMock(content="Fixed the pom.xml")
 
+    mock_engine = MagicMock()
+    mock_engine.run_phase.return_value = mock_build_result_ok
+
     with patch("asel.pipeline.clone_repo"), \
          patch("asel.pipeline.detect_language", return_value=Language.JAVA_MAVEN), \
          patch("asel.pipeline.ExecutionEnvironment"), \
-         patch("asel.pipeline.MavenBuildEngine") as mock_engine_cls, \
+         patch("asel.pipeline.MavenBuildEngine"), \
+         patch("asel.pipeline.create_engine", return_value=mock_engine), \
          patch("asel.pipeline.create_build_agent") as mock_build_agent_fn, \
          patch("asel.pipeline.ScannerOrchestrator") as mock_scanner_cls, \
          patch("asel.pipeline.create_remediation_agent") as mock_rem_agent_fn:
 
-        mock_engine_cls.return_value.progressive_phases.return_value = [BuildPhase.FULL_BUILD]
-        mock_engine_cls.return_value.run_phase.return_value = mock_build_result_ok
         mock_build_agent_fn.return_value.run.return_value = mock_run_output
         mock_scanner_cls.return_value.run.return_value = []  # no findings -> converge
         mock_rem_agent_fn.return_value.run.return_value = mock_run_output
