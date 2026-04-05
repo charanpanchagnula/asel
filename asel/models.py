@@ -10,12 +10,14 @@ from pydantic import BaseModel, model_validator
 
 class Language(str, Enum):
     JAVA_MAVEN = "java-maven"
+    JAVA_GRADLE = "java-gradle"
     AUTO_DETECT = "auto"
 
 
 class BuildPhase(str, Enum):
     DEPENDENCY_RESOLVE = "dependency_resolve"
     COMPILE = "compile"
+    UNIT_TEST = "unit_test"
     FULL_BUILD = "full_build"
 
 
@@ -79,11 +81,15 @@ class RunConfig(BaseModel):
     max_build_attempts: int = 5
 
     # Remediation loop — multi-signal termination
+    max_findings_to_remediate: int = 5   # attempt only top-N findings by severity per run
     max_remediation_iterations: int = 10
     min_findings_per_iteration: int = 3
     stall_threshold: int = 2
     min_delta_to_continue: int = 1
     max_runtime_minutes: int = 60
+
+    # Final test health check
+    final_test_timeout_minutes: int = 5  # kill unit tests if they exceed this
 
 
 class BuildResult(BaseModel):
