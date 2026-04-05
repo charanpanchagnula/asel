@@ -82,11 +82,9 @@ def test_select_maven_image_unknown_version_uses_default(tmp_path):
 
 def test_detect_language_java_gradle_groovy_dsl(tmp_path):
     (tmp_path / "build.gradle").write_text('plugins { id "java" }')
-    from asel.models import Language
     assert detect_language(tmp_path) == Language.JAVA_GRADLE
 
 
 def test_detect_language_java_gradle_kotlin_dsl(tmp_path):
     (tmp_path / "build.gradle.kts").write_text('plugins { java }')
-    from asel.models import Language
     assert detect_language(tmp_path) == Language.JAVA_GRADLE
