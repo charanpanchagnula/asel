@@ -47,4 +47,31 @@ def test_progressive_phases_order():
     phases = engine.progressive_phases()
     assert phases[0] == BuildPhase.DEPENDENCY_RESOLVE
     assert phases[1] == BuildPhase.COMPILE
-    assert phases[2] == BuildPhase.FULL_BUILD
+    assert BuildPhase.FULL_BUILD not in phases  # stabilization never runs tests
+
+
+import pytest
+from pathlib import Path
+from asel.build import BuildEngine
+from asel.models import Language
+
+
+def test_maven_engine_implements_build_engine():
+    engine = MavenBuildEngine(MagicMock())
+    assert isinstance(engine, BuildEngine)
+
+
+def test_create_engine_returns_maven_for_java_maven():
+    from asel.build import create_engine
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        engine = create_engine(Language.JAVA_MAVEN, MagicMock(), Path(d))
+    assert isinstance(engine, MavenBuildEngine)
+
+
+def test_create_engine_raises_for_unknown_language():
+    from asel.build import create_engine
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(ValueError, match="No build engine"):
+            create_engine(Language.AUTO_DETECT, MagicMock(), Path(d))
