@@ -163,13 +163,23 @@ class PipelineOrchestrator:
                 return (sev, scanner)
 
             # Paths excluded from remediation — non-source files the agent can't fix reliably.
-            # GitHub Actions workflows require CI-specific security knowledge; YAML configs
-            # are infrastructure, not application code.
+            # Prefix list: CI/CD configs and infra-as-code directories.
+            # Suffix list: file types that are never application source code (data, docs, infra,
+            # shell scripts). Findings in these files are intentional (CTF apps, test fixtures)
+            # or infrastructure — patching them is meaningless and wastes iteration budget.
             _EXCLUDED_PREFIXES = (".github/", ".gitlab-ci", ".circleci/")
-            _EXCLUDED_SUFFIXES = (".yml", ".yaml") if False else ()  # reserved — not used yet
+            _EXCLUDED_SUFFIXES = (
+                ".tf",             # Terraform — infrastructure, not application code
+                ".md", ".adoc", ".rst",  # documentation
+                ".txt", ".csv", ".sql",  # data files
+                ".sh", ".bash",    # shell scripts
+            )
 
             def _is_excluded(file_path: str) -> bool:
-                return any(file_path.startswith(p) for p in _EXCLUDED_PREFIXES)
+                return (
+                    any(file_path.startswith(p) for p in _EXCLUDED_PREFIXES)
+                    or any(file_path.endswith(s) for s in _EXCLUDED_SUFFIXES)
+                )
 
             # Group findings by (rule_id, file_path) — all instances of a pattern in one file
             # are fixed together in a single agent call. Preserves priority order.
@@ -181,7 +191,7 @@ class PipelineOrchestrator:
                     continue
                 raw_groups[(f.rule_id, f.file_path)].append(f)
             if excluded_count:
-                _step(f"[dim]Skipping {excluded_count} finding(s) in excluded paths (.github/, CI configs)[/dim]")
+                _step(f"[dim]Skipping {excluded_count} finding(s) in non-source files (infra, docs, data, CI configs)[/dim]")
 
             all_groups = sorted(raw_groups.values(), key=_group_priority)
             in_scope_groups = all_groups[: self._config.max_findings_to_remediate]
