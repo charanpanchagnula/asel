@@ -1,5 +1,6 @@
 # tests/test_scanners.py
 import json
+import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from asel.scanners import SemgrepScanner, TrivyScanner, GitleaksScanner, ScannerOrchestrator
@@ -102,11 +103,12 @@ def test_gitleaks_returns_empty_on_error(tmp_repo):
     assert findings == []
 
 
-def test_scanner_returns_empty_on_error(tmp_repo):
+def test_scanner_raises_on_error(tmp_repo):
+    """Non-timeout exceptions propagate so the orchestrator can handle them."""
     with patch("asel.scanners.docker.from_env") as mock_docker:
         mock_docker.return_value.containers.run.side_effect = Exception("container failed")
-        findings = SemgrepScanner().run(tmp_repo)
-    assert findings == []
+        with pytest.raises(Exception, match="container failed"):
+            SemgrepScanner().run(tmp_repo)
 
 
 def test_orchestrator_aggregates_all_scanners(tmp_repo):

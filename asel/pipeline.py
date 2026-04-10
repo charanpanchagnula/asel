@@ -1,7 +1,9 @@
 # asel/pipeline.py
+import concurrent.futures
 import logging
 import subprocess
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +16,7 @@ from .ingestor import clone_repo, detect_language, select_image
 from .llm_trace import append_turn, init_log
 from .models import (
     BuildPhase, BuildResult, IterationSnapshot, Language,
-    PatchAttempt, PatchTarget, RunConfig, RunState, RunStatus, ScanFinding,
+    PatchAttempt, PatchTarget, RunConfig, RunState, RunStatus, ScanFinding, ScannerType,
 )
 from .reporting import print_summary
 from .scanners import ScannerOrchestrator
@@ -22,13 +24,36 @@ from .scanners import ScannerOrchestrator
 logger = logging.getLogger(__name__)
 _console = Console()
 
-MAX_TRIES_PER_FINDING = 2   # give up on a finding after this many failed attempts
-MAX_BUILD_REPAIR_ATTEMPTS = 2  # how many times to ask the agent to fix its own broken patch
+MAX_TRIES_PER_FINDING = 2    # give up on a finding after this many failed attempts
+MAX_BUILD_REPAIR_ATTEMPTS = 2   # how many times to ask the agent to fix its own broken patch
+AGENT_REFRESH_INTERVAL = 15  # create a fresh agent every N iterations to avoid context bloat
+BUILD_AGENT_TIMEOUT_SECONDS = 20 * 60    # 20 min cap per build-agent call
+REMEDIATION_AGENT_TIMEOUT_SECONDS = 10 * 60  # 10 min cap per remediation-agent call
 
 
 def _step(msg: str) -> None:
     """Print a timestamped pipeline step to the console."""
     _console.print(f"[dim]{datetime.now(timezone.utc).strftime('%H:%M:%S')}[/dim]  {msg}")
+
+
+def _run_agent_with_timeout(agent, prompt: str, timeout_seconds: int):
+    """Run agent.run(prompt) with a hard wall-clock timeout.
+
+    Raises TimeoutError if the call doesn't return within timeout_seconds.
+    Uses shutdown(wait=False) so a timed-out thread doesn't block the pipeline
+    (the thread keeps running in the background until the HTTP call completes,
+    but the pipeline continues immediately).
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(agent.run, prompt)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(
+            f"Agent call exceeded {timeout_seconds // 60}m timeout"
+        )
+    finally:
+        executor.shutdown(wait=False)
 
 
 class PipelineOrchestrator:
@@ -60,6 +85,7 @@ class PipelineOrchestrator:
             # 2. Detect language
             try:
                 language = detect_language(repo_path)
+                state.language = language
             except ValueError as e:
                 _step(f"[red]Unsupported language:[/red] {e}")
                 state.status = RunStatus.UNSUPPORTED_LANGUAGE
@@ -89,9 +115,14 @@ class PipelineOrchestrator:
 
             # 5. Initial scan
             _step("[bold]Running scanners...[/bold]")
-            scanner = ScannerOrchestrator(self._config.enabled_scanners)
+            build_file = "build.gradle" if language == Language.JAVA_GRADLE else "pom.xml"
+            scanner = ScannerOrchestrator(self._config.enabled_scanners, build_file=build_file, language=language.value)
+            _scan_start = datetime.now(timezone.utc)
             findings = scanner.run(repo_path)
-            _step(f"[bold]Baseline scan:[/bold] {len(findings)} finding(s)")
+            baseline_scan_seconds = (datetime.now(timezone.utc) - _scan_start).total_seconds()
+            if scanner.had_timeout:
+                _step("[yellow]Warning: one or more scanners timed out on baseline — findings may be incomplete[/yellow]")
+            _step(f"[bold]Baseline scan:[/bold] {len(findings)} finding(s) ({baseline_scan_seconds/60:.1f}min)")
 
             baseline = IterationSnapshot(
                 iteration=0,
@@ -109,7 +140,7 @@ class PipelineOrchestrator:
                 self._save(state, run_dir)
                 return state
 
-            # 6. Remediation loop — one finding at a time
+            # 6. Remediation loop — one (rule_id, file_path) group at a time
             remediation_trace_path = run_dir / "llm-remediation-agent.md"
             init_log(remediation_trace_path, "Remediation Agent", state.run_id, state.repo_url)
             remediation_agent = create_remediation_agent(
@@ -119,83 +150,181 @@ class PipelineOrchestrator:
 
             priority_order = ["critical", "high", "medium", "low", "info"]
 
-            # Cap: scan all findings but only remediate the top N by severity
-            in_scope = {
-                f.id for f in sorted(findings, key=lambda f: priority_order.index(f.severity.value))
-                [: self._config.max_findings_to_remediate]
+            def _finding_priority(f: ScanFinding) -> int:
+                return priority_order.index(f.severity.value)
+
+            # Scanner order: Trivy CVEs (version bumps) are highest-confidence fixes → first.
+            # Gitleaks secrets next, then Semgrep SAST which requires deeper code understanding.
+            _scanner_order = {ScannerType.TRIVY: 0, ScannerType.GITLEAKS: 1, ScannerType.SEMGREP: 2}
+
+            def _group_priority(group: list[ScanFinding]) -> tuple:
+                sev = min(_finding_priority(f) for f in group)
+                scanner = _scanner_order.get(group[0].scanner, 9)
+                return (sev, scanner)
+
+            # Paths excluded from remediation — non-source files the agent can't fix reliably.
+            # GitHub Actions workflows require CI-specific security knowledge; YAML configs
+            # are infrastructure, not application code.
+            _EXCLUDED_PREFIXES = (".github/", ".gitlab-ci", ".circleci/")
+            _EXCLUDED_SUFFIXES = (".yml", ".yaml") if False else ()  # reserved — not used yet
+
+            def _is_excluded(file_path: str) -> bool:
+                return any(file_path.startswith(p) for p in _EXCLUDED_PREFIXES)
+
+            # Group findings by (rule_id, file_path) — all instances of a pattern in one file
+            # are fixed together in a single agent call. Preserves priority order.
+            raw_groups: dict[tuple[str, str], list[ScanFinding]] = defaultdict(list)
+            excluded_count = 0
+            for f in sorted(findings, key=_finding_priority):
+                if _is_excluded(f.file_path):
+                    excluded_count += 1
+                    continue
+                raw_groups[(f.rule_id, f.file_path)].append(f)
+            if excluded_count:
+                _step(f"[dim]Skipping {excluded_count} finding(s) in excluded paths (.github/, CI configs)[/dim]")
+
+            all_groups = sorted(raw_groups.values(), key=_group_priority)
+            in_scope_groups = all_groups[: self._config.max_findings_to_remediate]
+            in_scope_keys: set[tuple[str, str]] = {
+                (g[0].rule_id, g[0].file_path) for g in in_scope_groups
             }
+            total_in_scope = sum(len(g) for g in in_scope_groups)
 
-            # Scale the iteration budget: each in-scope finding gets MAX_TRIES_PER_FINDING attempts
-            effective_max = min(
-                self._config.max_remediation_iterations,
-                len(in_scope) * MAX_TRIES_PER_FINDING,
-            )
+            elapsed_before_loop = (datetime.now(timezone.utc) - state.started_at).total_seconds() / 60
+            remaining_minutes = self._config.max_runtime_minutes - elapsed_before_loop
+
+            # Per-iteration rescan cost: only the relevant scanner reruns, not all three.
+            # Use per-scanner baseline times (weighted by how many in-scope groups use each scanner)
+            # so we don't overestimate when e.g. Semgrep was slow but targets are all Trivy CVEs.
+            scanner_times_secs = scanner.scanner_times  # dict[ScannerType, float]
+            if not isinstance(scanner_times_secs, dict):
+                scanner_times_secs = {}
+            if in_scope_groups and scanner_times_secs:
+                # Fallback for scanners absent from scanner_times (timeout/failure):
+                # use the per-scanner average rather than the full parallel wall-clock time.
+                per_scanner_avg = baseline_scan_seconds / max(1, len(scanner_times_secs))
+                scanner_group_counts: dict[ScannerType, int] = defaultdict(int)
+                for g in in_scope_groups:
+                    scanner_group_counts[g[0].scanner] += 1
+                weighted_rescan_secs = sum(
+                    scanner_times_secs.get(s, per_scanner_avg) * cnt
+                    for s, cnt in scanner_group_counts.items()
+                ) / len(in_scope_groups)
+            else:
+                weighted_rescan_secs = baseline_scan_seconds
+            estimated_iter_minutes = (weighted_rescan_secs / 60) + 3.0
+            time_budget_max = max(1, int(remaining_minutes / estimated_iter_minutes))
+
+            # Upper bounds on iteration count: findings × retries and time budget.
+            # max_remediation_iterations is an optional explicit override (None = no override).
+            iter_bounds = [len(in_scope_groups) * MAX_TRIES_PER_FINDING, time_budget_max]
+            if self._config.max_remediation_iterations is not None:
+                iter_bounds.append(self._config.max_remediation_iterations)
+            effective_max = min(iter_bounds)
             _step(
-                f"[bold]Remediation loop:[/bold] {len(findings)} finding(s) found, "
-                f"remediating top {len(in_scope)}, "
-                f"up to {effective_max} iteration(s)"
+                f"[bold]Remediation loop:[/bold] {len(findings)} finding(s) across "
+                f"{len(all_groups)} group(s), remediating top {len(in_scope_groups)} group(s) "
+                f"({total_in_scope} finding(s)), up to {effective_max} iteration(s) "
+                f"(~{estimated_iter_minutes:.1f}min/iter, {remaining_minutes:.0f}min budget)"
             )
 
-            skip_ids: set[str] = set()   # findings we've exhausted tries on
-            tries: dict[str, int] = {}   # per-finding attempt counter
+            if effective_max == 0:
+                _step("[yellow]No remediation iterations available (empty scope or zero time budget)[/yellow]")
+                state.status = RunStatus.CONVERGED
+                state.completed_at = datetime.now(timezone.utc)
+                self._save(state, run_dir)
+                return state
+
+            skip_keys: set[tuple[str, str]] = set()
+            tries: dict[tuple[str, str], int] = {}
+            iterations_since_refresh = 0
 
             for iteration in range(1, effective_max + 1):
-                # Timeout check
                 elapsed_min = (
                     datetime.now(timezone.utc) - state.started_at
                 ).total_seconds() / 60
                 if elapsed_min >= self._config.max_runtime_minutes:
-                    state.status = RunStatus.TIMEOUT
-                    _step("[yellow]Timeout reached.[/yellow]")
+                    made_progress = len(state.findings) < len(findings)
+                    state.status = RunStatus.PARTIAL if made_progress else RunStatus.TIMEOUT
+                    _step("[yellow]Time budget reached.[/yellow]")
                     break
 
-                # Pick the highest-priority in-scope finding we haven't given up on
-                candidates = sorted(
-                    [f for f in state.findings if f.id in in_scope and f.id not in skip_ids],
-                    key=lambda f: priority_order.index(f.severity.value),
-                )
-                if not candidates:
+                # Rebuild live groups from current findings
+                live_groups: dict[tuple[str, str], list[ScanFinding]] = defaultdict(list)
+                for f in state.findings:
+                    key = (f.rule_id, f.file_path)
+                    if key in in_scope_keys and key not in skip_keys:
+                        live_groups[key].append(f)
+
+                if not live_groups:
                     state.status = RunStatus.CONVERGED
                     _step("[green]All actionable findings resolved — converged.[/green]")
                     break
 
-                target = candidates[0]
-                tries[target.id] = tries.get(target.id, 0) + 1
-                current_try = tries[target.id]
+                target_key, target_group = min(
+                    live_groups.items(), key=lambda kv: _group_priority(kv[1])
+                )
+                tries[target_key] = tries.get(target_key, 0) + 1
+                current_try = tries[target_key]
+                rep = target_group[0]
 
                 _step(
                     f"[bold cyan]Iteration {iteration}/{effective_max}[/bold cyan]  "
-                    f"[{target.severity.value.upper()}] {target.rule_id} "
-                    f"in {target.file_path} "
-                    f"(try {current_try}/{MAX_TRIES_PER_FINDING})"
+                    f"[{rep.severity.value.upper()}] {rep.rule_id} "
+                    f"in {rep.file_path} "
+                    f"({len(target_group)} instance(s), try {current_try}/{MAX_TRIES_PER_FINDING})"
                 )
 
+                # Refresh agent periodically to prevent context window exhaustion
+                if iterations_since_refresh >= AGENT_REFRESH_INTERVAL:
+                    remediation_agent = create_remediation_agent(
+                        repo_path, self._config.llm_model, self._config.llm_provider, env,
+                        language=language,
+                    )
+                    iterations_since_refresh = 0
+                    _step("[dim]Agent context refreshed[/dim]")
+
                 state = self._remediation_iteration(
-                    state, iteration, env, engine, remediation_agent, scanner, target, repo_path, run_dir,
+                    state, iteration, env, engine, remediation_agent, target_group, repo_path, run_dir,
+                    language=language,
                     trace_path=remediation_trace_path,
                 )
                 self._save(state, run_dir)
+                iterations_since_refresh += 1
 
-                # Was the target finding resolved?
-                current_ids = {f.id for f in state.findings}
-                actionable_remaining = len([f for f in state.findings if f.id not in skip_ids])
-
-                if target.id not in current_ids:
+                # No-change early skip — agent touched no files, structurally unfixable
+                last_patch = state.iterations[-1].patch_attempt
+                if last_patch and last_patch.skip_reason == "agent_no_changes":
+                    skip_keys.add(target_key)
+                    groups_remaining = len(live_groups) - 1
                     _step(
-                        f"  [green]Fixed:[/green] {target.rule_id} | "
-                        f"{actionable_remaining} actionable remaining"
+                        f"  [yellow]Skipping[/yellow] {rep.rule_id} — agent made no changes "
+                        f"| {groups_remaining} group(s) remaining"
                     )
-                    tries.pop(target.id, None)
+                    continue
+
+                # Was the group resolved? (all target finding IDs gone from new scan)
+                current_ids = {f.id for f in state.findings}
+                group_resolved = not any(f.id in current_ids for f in target_group)
+                groups_remaining = len(live_groups) - (1 if group_resolved else 0)
+
+                if group_resolved:
+                    _step(
+                        f"  [green]Fixed:[/green] {rep.rule_id} "
+                        f"({len(target_group)} instance(s)) | "
+                        f"{groups_remaining} group(s) remaining"
+                    )
+                    tries.pop(target_key, None)
                 else:
                     if current_try >= MAX_TRIES_PER_FINDING:
-                        skip_ids.add(target.id)
+                        skip_keys.add(target_key)
                         _step(
-                            f"  [yellow]Giving up on[/yellow] {target.rule_id} "
+                            f"  [yellow]Giving up on[/yellow] {rep.rule_id} "
                             f"after {current_try} tries | "
-                            f"{actionable_remaining - 1} actionable remaining"
+                            f"{groups_remaining - 1} group(s) remaining"
                         )
                     else:
-                        _step(f"  No progress on {target.rule_id} — will retry")
+                        _step(f"  No progress on {rep.rule_id} — will retry")
             else:
                 state.status = RunStatus.MAX_ITERATIONS
 
@@ -253,7 +382,11 @@ class PipelineOrchestrator:
                 language=language,
             )
             prompt = self._build_prompt(result, attempt)
-            run_output = agent.run(prompt)
+            try:
+                run_output = _run_agent_with_timeout(agent, prompt, BUILD_AGENT_TIMEOUT_SECONDS)
+            except TimeoutError as exc:
+                _step(f"  [yellow]BuildAgent timed out ({BUILD_AGENT_TIMEOUT_SECONDS // 60}m) — continuing without fix[/yellow]")
+                run_output = str(exc)
             append_turn(trace_path, label=f"Build stabilization — attempt {attempt} ({phase_label})", prompt=prompt, run_output=run_output)
 
         # Step 1: resolve deps (one attempt — if it fails, agent fixes then we move straight to compile)
@@ -286,6 +419,7 @@ class PipelineOrchestrator:
         prev_findings: list[ScanFinding],
         build_result: BuildResult,
         repo_path: Path | None = None,
+        target_findings: list[ScanFinding] | None = None,
     ) -> RunState:
         if repo_path is not None:
             self._rollback_repo(repo_path)
@@ -293,6 +427,7 @@ class PipelineOrchestrator:
         patch = PatchAttempt(
             iteration=iteration,
             target=PatchTarget.FINDING_REMEDIATION,
+            finding_ids=[f.id for f in (target_findings or [])],
             build_result_after=build_result,
             succeeded=False,
             findings_before=prev_ids,
@@ -314,29 +449,60 @@ class PipelineOrchestrator:
         env,
         engine,
         remediation_agent,
-        scanner,
-        target: ScanFinding,
+        targets: list[ScanFinding],
         repo_path: Path,
         run_dir: Path,
+        language: Language,
         trace_path: Path,
     ) -> RunState:
         prev_findings = state.findings
         prev_ids = [f.id for f in prev_findings]
+        rep = targets[0]
 
         self._snapshot_repo(repo_path)
-        prompt = self._remediation_prompt(target, iteration)
+        prompt = self._remediation_prompt(targets, iteration, language)
         try:
-            run_output = remediation_agent.run(prompt)
+            run_output = _run_agent_with_timeout(remediation_agent, prompt, REMEDIATION_AGENT_TIMEOUT_SECONDS)
         except Exception as exc:
             _step(f"  [red]Agent error — rolling back:[/red] {exc}")
             exc_result = BuildResult(success=False, phase=BuildPhase.COMPILE, output=str(exc), duration_seconds=0)
-            return self._fail_iteration(state, iteration, prev_findings, exc_result, repo_path)
+            return self._fail_iteration(state, iteration, prev_findings, exc_result, repo_path, targets)
         append_turn(
             trace_path,
-            label=f"Iteration {iteration} — [{target.severity.value.upper()}] {target.rule_id} in {target.file_path}",
+            label=(
+                f"Iteration {iteration} — [{rep.severity.value.upper()}] {rep.rule_id} "
+                f"in {rep.file_path} ({len(targets)} instance(s))"
+            ),
             prompt=prompt,
             run_output=run_output,
         )
+
+        # Early exit: if the agent touched no files, the finding is structurally unfixable.
+        # Skip compile + rescan entirely and signal the main loop to stop retrying.
+        _, early_files = self._capture_diff(repo_path)
+        if not early_files:
+            no_change_result = BuildResult(
+                success=True, phase=BuildPhase.COMPILE,
+                output="agent_no_changes", duration_seconds=0,
+            )
+            patch = PatchAttempt(
+                iteration=iteration,
+                target=PatchTarget.FINDING_REMEDIATION,
+                finding_ids=[f.id for f in targets],
+                build_result_after=no_change_result,
+                succeeded=False,
+                findings_before=prev_ids,
+                findings_after=prev_ids,
+                delta=0,
+                skip_reason="agent_no_changes",
+            )
+            state.iterations.append(IterationSnapshot(
+                iteration=iteration,
+                findings=prev_findings,
+                build_result=no_change_result,
+                patch_attempt=patch,
+            ))
+            return state
 
         build_result = engine.run_phase(BuildPhase.COMPILE)
         self._save_build_log(build_result, f"remediation-{iteration}", run_dir)
@@ -345,15 +511,15 @@ class PipelineOrchestrator:
         if not build_result.success:
             for repair_num in range(1, MAX_BUILD_REPAIR_ATTEMPTS + 1):
                 _step(f"  [yellow]Build broken — repair attempt {repair_num}/{MAX_BUILD_REPAIR_ATTEMPTS}[/yellow]")
-                repair_prompt = self._patch_repair_prompt(build_result, target)
+                repair_prompt = self._patch_repair_prompt(build_result, targets)
                 try:
-                    repair_output = remediation_agent.run(repair_prompt)
+                    repair_output = _run_agent_with_timeout(remediation_agent, repair_prompt, REMEDIATION_AGENT_TIMEOUT_SECONDS)
                 except Exception as exc:
                     _step(f"  [red]Repair agent error — rolling back:[/red] {exc}")
-                    return self._fail_iteration(state, iteration, prev_findings, build_result, repo_path)
+                    return self._fail_iteration(state, iteration, prev_findings, build_result, repo_path, targets)
                 append_turn(
                     trace_path,
-                    label=f"Iteration {iteration} — build repair {repair_num}/{MAX_BUILD_REPAIR_ATTEMPTS} for {target.rule_id}",
+                    label=f"Iteration {iteration} — build repair {repair_num}/{MAX_BUILD_REPAIR_ATTEMPTS} for {rep.rule_id}",
                     prompt=repair_prompt,
                     run_output=repair_output,
                 )
@@ -364,14 +530,26 @@ class PipelineOrchestrator:
 
         if not build_result.success:
             _step("  [red]Build repair exhausted — rolling back[/red]")
-            return self._fail_iteration(state, iteration, prev_findings, build_result, repo_path)
+            return self._fail_iteration(state, iteration, prev_findings, build_result, repo_path, targets)
 
-        # Re-scan
-        new_findings = scanner.run(repo_path)
+        # Capture what the agent changed before re-scanning
+        patch_diff, patch_files = self._capture_diff(repo_path)
+
+        # Re-scan with only the scanner that reported these findings.
+        # All targets in a group share the same scanner (same rule_id → same tool).
+        build_file = "build.gradle" if language == Language.JAVA_GRADLE else "pom.xml"
+        rescan = ScannerOrchestrator([rep.scanner], build_file=build_file, language=language.value)
+        fresh = rescan.run(repo_path)
+        if rescan.had_timeout:
+            _step(f"  [yellow]{rep.scanner.value} timed out — keeping previous findings[/yellow]")
+            fresh = [f for f in prev_findings if f.scanner == rep.scanner]
+        # Merge: fresh results from the target scanner + all other scanners unchanged
+        other_findings = [f for f in prev_findings if f.scanner != rep.scanner]
+        new_findings = other_findings + fresh
         new_ids = [f.id for f in new_findings]
         delta = len(prev_findings) - len(new_findings)
         introduced = any(fid not in prev_ids for fid in new_ids)
-        net_negative = introduced and delta < 0
+        net_negative = introduced and delta <= 0
 
         if net_negative:
             _step("  [red]Net-negative patch (new findings introduced) — rolling back[/red]")
@@ -380,6 +558,9 @@ class PipelineOrchestrator:
         patch = PatchAttempt(
             iteration=iteration,
             target=PatchTarget.FINDING_REMEDIATION,
+            finding_ids=[f.id for f in targets],
+            files_modified=patch_files,
+            diff=patch_diff,
             build_result_after=build_result,
             succeeded=delta > 0 and not net_negative,
             findings_before=prev_ids,
@@ -406,22 +587,49 @@ class PipelineOrchestrator:
             "Please fix the issue and verify by running Maven."
         )
 
-    def _remediation_prompt(self, target: ScanFinding, iteration: int) -> str:
+    def _remediation_prompt(self, targets: list[ScanFinding], iteration: int, language: Language) -> str:
+        verify_tool = (
+            "run_gradle_compile" if language == Language.JAVA_GRADLE else "run_maven_compile"
+        )
+        rep = targets[0]
+        if len(targets) == 1:
+            location = (
+                f"  File: {rep.file_path}"
+                + (f":{rep.line_number}" if rep.line_number else "")
+                + f"\n  Issue: {rep.title}"
+            )
+            count_note = ""
+        else:
+            instances = "\n".join(
+                f"    - Line {t.line_number or '?'}: {t.title}" for t in targets
+            )
+            location = f"  File: {rep.file_path}\n  Instances:\n{instances}"
+            count_note = f" ({len(targets)} instances in the same file — fix all of them)"
+
+        # Include description when it adds information beyond the title (e.g. Trivy has
+        # package name + installed version → fixed version in the description field).
+        description_note = ""
+        if rep.description and rep.description.strip() != rep.title.strip():
+            desc = rep.description[:300].rstrip()
+            if len(rep.description) > 300:
+                desc += "..."
+            description_note = f"\n  Description: {desc}"
+
         return (
-            f"Remediation iteration {iteration}. Fix this single finding:\n\n"
-            f"  [{target.severity.value.upper()}] {target.rule_id}\n"
-            f"  File: {target.file_path}"
-            + (f":{target.line_number}" if target.line_number else "")
-            + f"\n  Issue: {target.title}\n\n"
-            "Read the file first, apply the minimal fix, then optionally verify with run_maven_compile."
+            f"Remediation iteration {iteration}. Fix this finding{count_note}:\n\n"
+            f"  [{rep.severity.value.upper()}] {rep.rule_id}\n"
+            + location
+            + description_note
+            + f"\n\nRead the file first, apply the minimal fix to all instances, "
+            + f"then optionally verify with {verify_tool}."
         )
 
-    def _patch_repair_prompt(self, result: BuildResult, target: ScanFinding) -> str:
+    def _patch_repair_prompt(self, result: BuildResult, targets: list[ScanFinding]) -> str:
         errors = "\n".join(
             line for line in result.output.splitlines() if "[ERROR]" in line
         )[:2000]
         return (
-            f"Your patch introduced a compilation error while fixing {target.rule_id}. "
+            f"Your patch introduced a compilation error while fixing {targets[0].rule_id}. "
             "Fix the compilation error while preserving the security fix.\n\n"
             f"Compilation errors:\n{errors}\n\n"
             "Do NOT revert the security fix — only fix the compilation problem."
@@ -449,6 +657,20 @@ class PipelineOrchestrator:
         """Discard any uncommitted changes made by the agent."""
         subprocess.run(["git", "checkout", "."], cwd=repo_path, capture_output=True)
         subprocess.run(["git", "clean", "-fd"], cwd=repo_path, capture_output=True)
+
+    def _capture_diff(self, repo_path: Path) -> tuple[str, list[str]]:
+        """Return (unified diff, list of modified file paths) for uncommitted agent changes."""
+        if not repo_path.exists():
+            return "", []
+        diff_result = subprocess.run(
+            ["git", "diff"], cwd=repo_path, capture_output=True, text=True
+        )
+        diff = diff_result.stdout or ""
+        files_result = subprocess.run(
+            ["git", "diff", "--name-only"], cwd=repo_path, capture_output=True, text=True
+        )
+        files = [f for f in files_result.stdout.splitlines() if f]
+        return diff, files
 
     def _save(self, state: RunState, run_dir: Path) -> None:
         (run_dir / "run-state.json").write_text(state.model_dump_json(indent=2))

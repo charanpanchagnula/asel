@@ -56,8 +56,9 @@ class RunStatus(str, Enum):
     CONVERGED = "converged"
     STALLED = "stalled"
     MAX_ITERATIONS = "max_iterations"
+    PARTIAL = "partial"          # time budget exhausted but findings were reduced
     BUILD_FAILED = "build_failed"
-    TIMEOUT = "timeout"
+    TIMEOUT = "timeout"          # time budget exhausted with no progress
     UNSUPPORTED_LANGUAGE = "unsupported_language"
 
 
@@ -82,7 +83,7 @@ class RunConfig(BaseModel):
 
     # Remediation loop — multi-signal termination
     max_findings_to_remediate: int = 5   # attempt only top-N findings by severity per run
-    max_remediation_iterations: int = 10
+    max_remediation_iterations: Optional[int] = None  # explicit cap; None = bounded by findings × tries and time budget
     min_findings_per_iteration: int = 3
     stall_threshold: int = 2
     min_delta_to_continue: int = 1
@@ -131,6 +132,7 @@ class PatchAttempt(BaseModel):
     delta: int = 0
     introduced_new_findings: bool = False
     succeeded: bool = False
+    skip_reason: Optional[str] = None  # e.g. "agent_no_changes"
 
 
 class IterationSnapshot(BaseModel):
@@ -146,6 +148,7 @@ class RunState(BaseModel):
     started_at: datetime
     completed_at: Optional[datetime] = None
     build_track: BuildTrack = BuildTrack.FULL
+    language: Optional[Language] = None
     build_attempts: list[BuildResult] = []
     iterations: list[IterationSnapshot] = []
     findings: list[ScanFinding] = []

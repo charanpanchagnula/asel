@@ -14,7 +14,6 @@ def make_config(tmp_path, **overrides) -> RunConfig:
         repo_url="https://github.com/example/demo",
         output_dir=tmp_path,
         max_build_attempts=3,
-        max_remediation_iterations=10,
         stall_threshold=2,
     )
     defaults.update(overrides)
@@ -94,6 +93,8 @@ def test_run_converges_when_no_findings(tmp_path):
          patch("asel.pipeline.ScannerOrchestrator") as mock_scanner_cls, \
          patch("asel.pipeline.create_remediation_agent"):
         mock_scanner_cls.return_value.run.return_value = []
+        mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
     assert state.status == RunStatus.CONVERGED
@@ -118,8 +119,11 @@ def test_patch_rolled_back_when_build_fails(tmp_path):
          patch("asel.pipeline.ScannerOrchestrator") as mock_scanner_cls, \
          patch("asel.pipeline.create_remediation_agent"), \
          patch("asel.pipeline.PipelineOrchestrator._snapshot_repo") as mock_snap, \
-         patch("asel.pipeline.PipelineOrchestrator._rollback_repo") as mock_rollback:
+         patch("asel.pipeline.PipelineOrchestrator._rollback_repo") as mock_rollback, \
+         patch("asel.pipeline.PipelineOrchestrator._capture_diff", return_value=("diff", ["pom.xml"])):
         mock_scanner_cls.return_value.run.return_value = [finding]
+        mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
     assert mock_snap.call_count >= 1
@@ -144,13 +148,16 @@ def test_patch_rolled_back_when_net_negative(tmp_path):
          patch("asel.pipeline.ScannerOrchestrator") as mock_scanner_cls, \
          patch("asel.pipeline.create_remediation_agent"), \
          patch("asel.pipeline.PipelineOrchestrator._snapshot_repo"), \
-         patch("asel.pipeline.PipelineOrchestrator._rollback_repo") as mock_rollback:
+         patch("asel.pipeline.PipelineOrchestrator._rollback_repo") as mock_rollback, \
+         patch("asel.pipeline.PipelineOrchestrator._capture_diff", return_value=("diff", ["pom.xml"])):
         # Baseline: 1 finding. Every post-patch scan: net-negative (2 findings).
         # Provide enough results for MAX_TRIES_PER_FINDING iterations.
         mock_scanner_cls.return_value.run.side_effect = (
             [[original_finding]]  # baseline
             + [[original_finding, new_finding]] * MAX_TRIES_PER_FINDING  # each re-scan
         )
+        mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
     assert mock_rollback.call_count >= 1
@@ -173,11 +180,14 @@ def test_converges_when_finding_fixed(tmp_path):
          patch("asel.pipeline.ScannerOrchestrator") as mock_scanner_cls, \
          patch("asel.pipeline.create_remediation_agent"), \
          patch("asel.pipeline.PipelineOrchestrator._snapshot_repo"), \
-         patch("asel.pipeline.PipelineOrchestrator._rollback_repo"):
+         patch("asel.pipeline.PipelineOrchestrator._rollback_repo"), \
+         patch("asel.pipeline.PipelineOrchestrator._capture_diff", return_value=("diff", ["pom.xml"])):
         mock_scanner_cls.return_value.run.side_effect = [
             [finding],  # baseline
             [],         # after patch: finding gone
         ]
+        mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
     assert state.status == RunStatus.CONVERGED
@@ -200,13 +210,16 @@ def test_skips_stuck_finding_and_moves_on(tmp_path):
          patch("asel.pipeline.ScannerOrchestrator") as mock_scanner_cls, \
          patch("asel.pipeline.create_remediation_agent"), \
          patch("asel.pipeline.PipelineOrchestrator._snapshot_repo"), \
-         patch("asel.pipeline.PipelineOrchestrator._rollback_repo"):
+         patch("asel.pipeline.PipelineOrchestrator._rollback_repo"), \
+         patch("asel.pipeline.PipelineOrchestrator._capture_diff", return_value=("diff", ["pom.xml"])):
         mock_scanner_cls.return_value.run.side_effect = [
             [stuck, fixable],          # baseline
             [stuck, fixable],          # iter 1: stuck finding unchanged
             [stuck, fixable],          # iter 2: stuck finding unchanged (now skipped)
             [stuck],                   # iter 3: fixable resolved
         ]
+        mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
     # fixable should be gone; stuck remains (was skipped, not rolled back)
@@ -228,6 +241,8 @@ def test_run_state_is_written_to_disk(tmp_path):
          patch("asel.pipeline.ScannerOrchestrator") as mock_scanner_cls, \
          patch("asel.pipeline.create_remediation_agent"):
         mock_scanner_cls.return_value.run.return_value = []
+        mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
     run_dir = tmp_path / state.run_id

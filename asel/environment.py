@@ -25,10 +25,18 @@ class ExecutionEnvironment:
             network_mode="bridge",
         )
 
-    def run(self, command: list[str]) -> tuple[int, str]:
-        """Run a command inside the container. Returns (exit_code, combined output)."""
+    def run(self, command: list[str], timeout_seconds: int | None = None) -> tuple[int, str]:
+        """Run a command inside the container. Returns (exit_code, combined output).
+
+        If timeout_seconds is set and the command exceeds it, the exec is killed
+        and exit_code 124 is returned (same convention as the Unix `timeout` command).
+        """
         if self._container is None:
             raise RuntimeError("Container not started — call start() first")
+
+        if timeout_seconds is not None:
+            command = ["timeout", str(timeout_seconds)] + command
+
         result = self._container.exec_run(
             command,
             workdir="/workspace",

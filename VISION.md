@@ -109,7 +109,22 @@ But:
 
 ---
 
-# 4. Phase 1 – Minimal Viable Execution Lab (POC)
+# 4. Development Layer Model
+
+Before expanding scope, each layer below should be characterized before treating the next as stable. The system currently operates at Layer 4, but Layers 1–3 are not yet fully characterized.
+
+| Layer | Goal | Signal |
+|---|---|---|
+| **1 — Environment Normalization** | Can arbitrary projects be reliably built in a container? | % of projects that reach a clean compile with no agent involvement |
+| **2 — Patch Generation Quality** | Are generated patches syntactically valid and minimal? | % of patches that apply cleanly and parse without errors |
+| **3 — Compile-Only Validation** | Does the patch survive a rebuild? | Compile success rate after first patch attempt |
+| **4 — Full Closed Loop** | Does the system converge with rollback and rescan? | Remediation success rate, rollback frequency, loops per vuln |
+
+Skipping ahead to Layer 4 before Layer 1 is stable is a major source of token burn and noise. Characterize each layer before expanding the next.
+
+---
+
+# 5. Phase 1 – Minimal Viable Execution Lab (POC)
 
 Goal:
 
@@ -169,7 +184,7 @@ And produces:
 
 ---
 
-# 5. Phase 2 – Runtime Stabilization & Surface Expansion
+# 6. Phase 2 – Runtime Stabilization & Surface Expansion
 
 Goal:
 
@@ -213,7 +228,7 @@ A system that can:
 
 ---
 
-# 6. Long-Term Vision (Beyond Phase 2)
+# 7. Long-Term Vision (Beyond Phase 2)
 
 Not for immediate implementation.
 
@@ -228,7 +243,7 @@ Potential directions:
 
 ---
 
-# 7. Differentiation Hypothesis
+# 8. Differentiation Hypothesis
 
 Existing tools:
 
@@ -248,7 +263,7 @@ ASEL explores:
 
 ---
 
-# 8. Constraints & Design Principles
+# 9. Constraints & Design Principles
 
 1. Keep orchestration simple.
 2. Prefer Docker over complex infra.
@@ -258,7 +273,7 @@ ASEL explores:
 
 ---
 
-# 9. Success Criteria (Phase 1)
+# 10. Success Criteria (Phase 1)
 
 The POC is successful if:
 
@@ -269,9 +284,21 @@ The POC is successful if:
 
 Even if imperfect.
 
+### Target Metrics
+
+To claim progressive improvement, track these across runs:
+
+| Metric | Description |
+|---|---|
+| Build normalization rate | % of repos that reach a clean compile |
+| Patch survival rate | % of first patch attempts that compile without repair |
+| Rollback frequency | % of remediation iterations that end in rollback |
+| Average loops per vuln | How many iterations before a finding is resolved or abandoned |
+| Token cost per successful fix | Total LLM tokens consumed per resolved finding |
+
 ---
 
-# 10. Strategic Optionality
+# 11. Strategic Optionality
 
 If successful, this system can later be positioned as:
 
@@ -286,7 +313,7 @@ It is a technical experiment.
 
 ---
 
-# 11. Final Framing
+# 12. Final Framing
 
 This is not an enterprise product.
 This is not a replacement for security tools.

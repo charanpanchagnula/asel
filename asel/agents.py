@@ -34,21 +34,72 @@ def _make_model(model_id: str, provider: str):
 
 
 def _make_file_tools(repo_path: Path) -> list:
+    _repo_root = repo_path.resolve()
+
+    def _safe_resolve(path: str) -> Path | None:
+        """Return resolved path if it stays within the repo, else None."""
+        full = (_repo_root / path).resolve()
+        if not full.is_relative_to(_repo_root):
+            return None
+        return full
+
     @tool
-    def read_file(path: str) -> str:
-        """Read a file from the repository by its relative path."""
-        full = repo_path / path
+    def read_file(
+        path: str,
+        start_line: int = 0,
+        end_line: int = 0,
+        start: int = 0,
+        end: int = 0,
+        substring: bool = False,
+    ) -> str:
+        """Read a file from the repository by its relative path.
+
+        Optional line range (1-indexed, inclusive):
+          - start_line / start: first line to read (1-indexed). 0 means beginning.
+          - end_line / end: last line to read (inclusive). 0 means end of file.
+
+        Use start_line/end_line (or start/end) for large files to avoid the 8000-char
+        truncation limit. When no range is given, reads the whole file (truncated at 8000 chars).
+        """
+        full = _safe_resolve(path)
+        if full is None:
+            return f"Blocked: {path} escapes the repository boundary"
         if not full.exists():
             return f"File not found: {path}"
         content = full.read_text()
+        # Accept either start_line/end_line or start/end aliases
+        sl = start_line or start
+        el = end_line or end
+        if sl > 0 or el > 0:
+            lines = content.splitlines()
+            total = len(lines)
+            s = max(0, sl - 1) if sl > 0 else 0
+            e = min(total, el) if el > 0 else total
+            selected = lines[s:e]
+            header = f"[Lines {s+1}-{s+len(selected)} of {total}]\n"
+            return header + "\n".join(selected)
         if len(content) > _MAX_FILE_CHARS:
             return content[:_MAX_FILE_CHARS] + f"\n[... truncated at {_MAX_FILE_CHARS} chars ...]"
         return content
 
     @tool
     def edit_file(path: str, old_text: str, new_text: str) -> str:
-        """Replace old_text with new_text in a file. old_text must match exactly."""
-        full = repo_path / path
+        """Replace old_text with new_text in a file. old_text must match exactly.
+
+        IMPORTANT: old_text must be a small, targeted snippet (≤500 chars).
+        If you need to edit a dependency version, pass just the <version> tag or the
+        2-3 line block containing it — NOT the entire file.
+        Use grep_file() first to locate the exact text to pass as old_text.
+        """
+        if len(old_text) > 500:
+            return (
+                f"ERROR: old_text is {len(old_text)} chars — too large (max 500). "
+                f"Pass a small targeted snippet, not the whole file. "
+                f"Use grep_file('{path}', '<search-term>') to locate the exact lines to change."
+            )
+        full = _safe_resolve(path)
+        if full is None:
+            return f"Blocked: {path} escapes the repository boundary"
         if not full.exists():
             return f"File not found: {path}"
         content = full.read_text()
@@ -60,7 +111,9 @@ def _make_file_tools(repo_path: Path) -> list:
     @tool
     def create_file(path: str, content: str) -> str:
         """Create a new file in the repository. Fails if the file already exists."""
-        full = repo_path / path
+        full = _safe_resolve(path)
+        if full is None:
+            return f"Blocked: {path} escapes the repository boundary"
         if full.exists():
             return f"File already exists: {path} — use edit_file instead"
         full.parent.mkdir(parents=True, exist_ok=True)
@@ -68,18 +121,71 @@ def _make_file_tools(repo_path: Path) -> list:
         return f"Created {path}"
 
     @tool
+    def read_file_lines(path: str, start_line: int, end_line: int) -> str:
+        """Read a specific range of lines from a file (1-indexed, inclusive).
+        Use this to read a section of a large file without loading all of it.
+        Example: read_file_lines('pom.xml', 1, 50) reads the first 50 lines.
+        """
+        full = _safe_resolve(path)
+        if full is None:
+            return f"Blocked: {path} escapes the repository boundary"
+        if not full.exists():
+            return f"File not found: {path}"
+        lines = full.read_text().splitlines()
+        total = len(lines)
+        s = max(0, start_line - 1)
+        e = min(total, end_line)
+        selected = lines[s:e]
+        header = f"[Lines {s+1}-{s+len(selected)} of {total}]\n"
+        return header + "\n".join(selected)
+
+    @tool
+    def grep_file(path: str, pattern: str, context_lines: int = 3) -> str:
+        """Search for a pattern in a file and return matching lines with context.
+        Use this to locate the exact text to pass as old_text in edit_file.
+        Example: grep_file('pom.xml', 'log4j-core') finds the log4j dependency block.
+        """
+        import re
+        full = _safe_resolve(path)
+        if full is None:
+            return f"Blocked: {path} escapes the repository boundary"
+        if not full.exists():
+            return f"File not found: {path}"
+        if full.is_dir():
+            return f"Path is a directory: {path} — provide a specific file path"
+        lines = full.read_text().splitlines()
+        results = []
+        emitted_up_to = -1  # last line index already included in output
+        for i, line in enumerate(lines):
+            if re.search(pattern, line, re.IGNORECASE):
+                lo = max(emitted_up_to + 1, i - context_lines)
+                hi = min(len(lines), i + context_lines + 1)
+                block = "\n".join(f"{j+1}: {lines[j]}" for j in range(lo, hi))
+                results.append(block)
+                emitted_up_to = hi - 1
+                if len(results) >= 15:
+                    results.append(f"[results capped at 15 matches — refine your pattern]")
+                    break
+        if not results:
+            return f"Pattern '{pattern}' not found in {path}"
+        return f"\n{'---'*10}\n".join(results)
+
+    @tool
     def list_files(subdir: str = ".") -> str:
         """List files in a subdirectory of the repo (max 50 results)."""
-        target = repo_path / subdir
+        target = _safe_resolve(subdir)
+        if target is None:
+            return f"Blocked: {subdir} escapes the repository boundary"
         if not target.is_dir():
             return f"Not a directory: {subdir}"
+        abs_repo = repo_path.resolve()
         files = sorted(
-            str(p.relative_to(repo_path))
+            str(p.resolve().relative_to(abs_repo))
             for p in itertools.islice((p for p in target.rglob("*") if p.is_file()), 50)
         )
         return "\n".join(files)
 
-    return [read_file, edit_file, create_file, list_files]
+    return [read_file, read_file_lines, grep_file, edit_file, create_file, list_files]
 
 
 _BUILD_INSTRUCTIONS: dict[Language, str] = {
@@ -87,11 +193,16 @@ _BUILD_INSTRUCTIONS: dict[Language, str] = {
 You are a Maven build repair expert. Your job is to fix build failures in Java/Maven projects.
 
 Available tools:
-- read_file(path)       — read a file by repo-relative path (e.g. "pom.xml")
-- edit_file(path, old_text, new_text) — replace exact text in an existing file
-- create_file(path, content) — create a new file that does not yet exist
-- list_files(subdir)    — list files under a subdirectory
-- run_maven(args)       — run Maven inside the build container
+- read_file(path)                        — read a file (truncated at 8000 chars for large files)
+- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
+- edit_file(path, old_text, new_text)    — replace EXACT text in an existing file
+- create_file(path, content)             — create a new file that does not yet exist
+- list_files(subdir)                     — list files under a subdirectory
+- run_maven(args)                        — run Maven inside the build container
+
+CRITICAL: edit_file old_text must be a small targeted snippet, NOT the whole file.
+Use grep_file to locate the exact text first, then edit just that section.
 
 File paths are always relative to the repository root (no leading slash).
 
@@ -109,11 +220,16 @@ NEVER change <java.version>, <maven.compiler.source>, or <maven.compiler.release
 You are a Gradle build repair expert. Your job is to fix build failures in Java/Gradle projects.
 
 Available tools:
-- read_file(path)       — read a file by repo-relative path (e.g. "build.gradle")
-- edit_file(path, old_text, new_text) — replace exact text in an existing file
-- create_file(path, content) — create a new file that does not yet exist
-- list_files(subdir)    — list files under a subdirectory
-- run_gradle(args)      — run Gradle inside the build container
+- read_file(path)                        — read a file (truncated at 8000 chars for large files)
+- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
+- edit_file(path, old_text, new_text)    — replace EXACT text in an existing file
+- create_file(path, content)             — create a new file that does not yet exist
+- list_files(subdir)                     — list files under a subdirectory
+- run_gradle(args)                       — run Gradle inside the build container
+
+CRITICAL: edit_file old_text must be a small targeted snippet, NOT the whole file.
+Use grep_file to locate the exact text first, then edit just that section.
 
 File paths are always relative to the repository root (no leading slash).
 
@@ -131,20 +247,70 @@ NEVER change sourceCompatibility or targetCompatibility.
 
 _REMEDIATION_INSTRUCTIONS: dict[Language, str] = {
     Language.JAVA_MAVEN: """\
-You are a security vulnerability remediation expert for Java/Maven projects.
+You are a security vulnerability remediation expert. Your job is to fix security findings in \
+any file within a JVM project that uses Maven as its build tool.
+
+The project is primarily Java/Kotlin/Groovy, but the repository may also contain JavaScript, \
+TypeScript, Python, HTML, YAML, Dockerfiles, shell scripts, or other files. Fix findings in \
+whatever language they appear in — use your knowledge of that language's security best practices.
 
 Available tools:
-- read_file(path), edit_file(path, old_text, new_text), create_file(path, content), list_files(subdir)
-- run_maven_compile()   — quick compile check inside the build container
+- read_file(path)                        — read a file (truncated at 8000 chars for large files)
+- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
+- edit_file(path, old_text, new_text)    — replace EXACT text in a file (surgical edit only)
+- create_file(path, content)             — create a new file
+- list_files(subdir)                     — list files under a directory
+- run_maven_compile()                    — quick compile check inside the build container
+
+CRITICAL RULES for edit_file:
+- old_text MUST be a small, targeted snippet — the specific line(s) you are changing.
+- NEVER use the entire file content as old_text. This will cause a JSON overflow error.
+- Always use grep_file first to locate the exact text before calling edit_file.
+
+Workflow for a Trivy CVE (dependency version bump in pom.xml):
+1. grep_file('pom.xml', '<artifactId>affected-lib</artifactId>') to find the dependency
+2. edit_file with just the version snippet as old_text
+3. run_maven_compile() to verify
+
+Workflow for a Semgrep finding in any language file:
+1. read_file or read_file_lines to see the flagged code
+2. edit_file with the minimal fix appropriate for that language
+3. run_maven_compile() if the fix touches JVM source files; skip compile check for non-JVM files
 
 Fix ONE security finding per invocation with the minimal change. Never remove security checks.
 """,
     Language.JAVA_GRADLE: """\
-You are a security vulnerability remediation expert for Java/Gradle projects.
+You are a security vulnerability remediation expert. Your job is to fix security findings in \
+any file within a JVM project that uses Gradle as its build tool.
+
+The project is primarily Java/Kotlin/Groovy, but the repository may also contain JavaScript, \
+TypeScript, Python, HTML, YAML, Dockerfiles, shell scripts, or other files. Fix findings in \
+whatever language they appear in — use your knowledge of that language's security best practices.
 
 Available tools:
-- read_file(path), edit_file(path, old_text, new_text), create_file(path, content), list_files(subdir)
-- run_gradle_compile()  — quick compile check inside the build container
+- read_file(path)                        — read a file (truncated at 8000 chars for large files)
+- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
+- edit_file(path, old_text, new_text)    — replace EXACT text in a file (surgical edit only)
+- create_file(path, content)             — create a new file
+- list_files(subdir)                     — list files under a directory
+- run_gradle_compile()                   — quick compile check inside the build container
+
+CRITICAL RULES for edit_file:
+- old_text MUST be a small, targeted snippet — the specific line(s) you are changing.
+- NEVER use the entire file content as old_text. This will cause a JSON overflow error.
+- Always use grep_file first to locate the exact text before calling edit_file.
+
+Workflow for a Trivy CVE (dependency version bump in build.gradle / build.gradle.kts):
+1. grep_file('build.gradle', 'affected-lib') to find the dependency line
+2. edit_file with just that dependency line as old_text
+3. run_gradle_compile() to verify
+
+Workflow for a Semgrep finding in any language file:
+1. read_file or read_file_lines to see the flagged code
+2. edit_file with the minimal fix appropriate for that language
+3. run_gradle_compile() if the fix touches JVM source files; skip compile check for non-JVM files
 
 Fix ONE security finding per invocation with the minimal change. Never remove security checks.
 """,

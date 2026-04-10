@@ -12,7 +12,7 @@ from asel.models import (
 def test_run_config_defaults():
     cfg = RunConfig(repo_url="https://github.com/x/y", output_dir=Path("/tmp"))
     assert cfg.max_build_attempts == 5
-    assert cfg.max_remediation_iterations == 10
+    assert cfg.max_remediation_iterations is None
     assert cfg.stall_threshold == 2
     assert cfg.min_delta_to_continue == 1
     assert cfg.max_runtime_minutes == 60
