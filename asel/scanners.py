@@ -196,8 +196,16 @@ class TrivyScanner(BaseScanner):
             exit_code = exit_info["StatusCode"]
             if exit_code not in (0, 1):  # 1 = vulnerabilities found (normal)
                 raise RuntimeError(f"trivy exited with code {exit_code}")
+            # Prefer stdout; fall back to stderr (some Trivy versions route JSON there).
+            # Use raw_decode to skip any leading log lines before the JSON object/array.
             output = container.logs(stdout=True, stderr=False)
-            data = json.loads(output)
+            if not output.strip():
+                output = container.logs(stdout=False, stderr=True)
+            text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else output
+            start = next((i for i, c in enumerate(text) if c in "{["), None)
+            if start is None:
+                raise RuntimeError("trivy produced no JSON output")
+            data, _ = json.JSONDecoder().raw_decode(text, start)
             findings = []
             for result in data.get("Results", []):
                 for v in result.get("Vulnerabilities") or []:

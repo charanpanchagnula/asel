@@ -776,10 +776,19 @@ class RuntimeEngine:
 
         self._manifest_env = self._read_manifest_env()
         container_port = self._detect_port()
-        host_port = _free_port()
-        self._host_port = host_port
 
-        self._start_runtime_container(host_port, container_port)
+        # Retry port allocation up to 3 times: _free_port() releases the socket before
+        # Docker binds it, so the OS may reallocate the port to another process (TOCTOU).
+        for _attempt in range(3):
+            host_port = _free_port()
+            self._host_port = host_port
+            try:
+                self._start_runtime_container(host_port, container_port)
+                break
+            except docker.errors.APIError as exc:
+                if "address already in use" not in str(exc) or _attempt == 2:
+                    raise
+                logger.warning("Host port %d already in use — retrying with new port", host_port)
         self._start_http_proxy(self._runtime_container)
         return self._run_startup_attempts(service_type, jar, host_port, container_port, timeout_seconds)
 
@@ -935,7 +944,8 @@ class RuntimeEngine:
                 continue
             text = f.read_text(errors="replace")
             # Single-line: server.port=8080 or server.port: 8080
-            m = re.search(r"server[._]port\s*[=:]\s*(\d+)", text)
+            # Anchored to start-of-line to avoid matching e.g. mcp.server.port
+            m = re.search(r"^server[._]port\s*[=:]\s*(\d+)", text, re.MULTILINE)
             if m:
                 return int(m.group(1))
             # YAML multi-line: server:\n  port: 8080
