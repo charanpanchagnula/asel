@@ -1461,6 +1461,10 @@ class RuntimeEngine:
             h2_mode = self._detect_h2_mode()
             ds_flags = [f.replace("{mode}", h2_mode) if "{mode}" in f else f for f in _H2_BASE_FLAGS]
             label = "h2_override"
+        # Persist so subsequent attempts (e.g. attempt 4 JWT retry) inherit these overrides.
+        for f in ds_flags + _SECURITY_DISABLE_FLAGS:
+            if f not in state.infra_flags:
+                state.infra_flags.append(f)
         return self._try_attempt(label, state, extra_flags=ds_flags + _SECURITY_DISABLE_FLAGS)
 
     def _run_startup_attempts(
