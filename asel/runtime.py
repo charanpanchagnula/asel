@@ -1426,7 +1426,9 @@ class RuntimeEngine:
         ):
             return None
         synthesized = synthesize_config(state.log, self._repo_path)
-        if state.failure_class is RuntimeFailureClass.AUTH_BOOTSTRAP and re.search(
+        if state.failure_class in (
+            RuntimeFailureClass.AUTH_BOOTSTRAP, RuntimeFailureClass.UNKNOWN,
+        ) and re.search(
             r"Decode argument cannot be null|jwt.*base64.*null|base64.*secret.*null",
             state.log, re.IGNORECASE,
         ):
