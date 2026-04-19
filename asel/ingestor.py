@@ -14,7 +14,7 @@ _MAVEN_IMAGES: list[tuple[int, str]] = [
     (21, "maven:3.9-eclipse-temurin-21"),
     (25, "maven:3.9-eclipse-temurin-25"),
 ]
-_DEFAULT_MAVEN_IMAGE = "maven:3.9-eclipse-temurin-25"
+_DEFAULT_MAVEN_IMAGE = "maven:3.9-eclipse-temurin-21"
 
 # ---------------------------------------------------------------------------
 # Gradle images — official Gradle images with bundled JDK
@@ -68,7 +68,8 @@ def detect_java_version(repo_path: Path) -> int | None:
         return None
     text = pom.read_text(encoding="utf-8", errors="replace")
     for tag in ("java.version", "maven.compiler.source", "maven.compiler.release"):
-        m = re.search(rf"<{tag}>\s*(\d+)\s*</{tag}>", text)
+        # Handle both "8" and legacy "1.8" style version strings (Java 8 era)
+        m = re.search(rf"<{tag}>\s*(?:1\.)?(\d+)\s*</{tag}>", text)
         if m:
             return int(m.group(1))
     return None

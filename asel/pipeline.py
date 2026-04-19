@@ -1,7 +1,7 @@
 # asel/pipeline.py
-import concurrent.futures
 import logging
 import subprocess
+import threading
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -16,8 +16,11 @@ from .ingestor import clone_repo, detect_language, select_image
 from .llm_trace import append_turn, init_log
 from .models import (
     BuildPhase, BuildResult, IterationSnapshot, Language,
-    PatchAttempt, PatchTarget, RunConfig, RunState, RunStatus, ScanFinding, ScannerType,
+    PatchAttempt, PatchTarget, RunConfig, RunState, RunStatus, RuntimeStatus, ScanFinding, ScannerType,
 )
+from .exploit import ExploitEngine
+from .runtime import RuntimeEngine
+from .surface import SurfaceDiscovery
 from .reporting import print_summary
 from .scanners import ScannerOrchestrator
 
@@ -28,7 +31,29 @@ MAX_TRIES_PER_FINDING = 2    # give up on a finding after this many failed attem
 MAX_BUILD_REPAIR_ATTEMPTS = 2   # how many times to ask the agent to fix its own broken patch
 AGENT_REFRESH_INTERVAL = 15  # create a fresh agent every N iterations to avoid context bloat
 BUILD_AGENT_TIMEOUT_SECONDS = 20 * 60    # 20 min cap per build-agent call
-REMEDIATION_AGENT_TIMEOUT_SECONDS = 10 * 60  # 10 min cap per remediation-agent call
+REMEDIATION_AGENT_TIMEOUT_SECONDS = 5 * 60   # 5 min cap per remediation-agent call
+
+# Paths excluded from remediation — non-source files the agent can't fix reliably.
+_EXCLUDED_PREFIXES = (".github/", ".gitlab-ci", ".circleci/")
+_EXCLUDED_SUFFIXES = (".tf", ".md", ".adoc", ".rst", ".txt", ".csv", ".sql", ".sh", ".bash")
+
+_PRIORITY_ORDER = ["critical", "high", "medium", "low", "info"]
+_SCANNER_ORDER = {ScannerType.TRIVY: 0, ScannerType.GITLEAKS: 1, ScannerType.SEMGREP: 2}
+
+
+def _finding_priority(f: ScanFinding) -> int:
+    return _PRIORITY_ORDER.index(f.severity.value)
+
+
+def _group_priority(group: list[ScanFinding]) -> tuple:
+    return (min(_finding_priority(f) for f in group), _SCANNER_ORDER.get(group[0].scanner, 9))
+
+
+def _is_excluded(file_path: str) -> bool:
+    return (
+        any(file_path.startswith(p) for p in _EXCLUDED_PREFIXES)
+        or any(file_path.endswith(s) for s in _EXCLUDED_SUFFIXES)
+    )
 
 
 def _step(msg: str) -> None:
@@ -40,20 +65,33 @@ def _run_agent_with_timeout(agent, prompt: str, timeout_seconds: int):
     """Run agent.run(prompt) with a hard wall-clock timeout.
 
     Raises TimeoutError if the call doesn't return within timeout_seconds.
-    Uses shutdown(wait=False) so a timed-out thread doesn't block the pipeline
-    (the thread keeps running in the background until the HTTP call completes,
-    but the pipeline continues immediately).
+
+    Uses a daemon thread + threading.Event rather than ThreadPoolExecutor so that
+    a timed-out call never blocks the pipeline.  ThreadPoolExecutor.__del__ calls
+    shutdown(wait=True), which blocks until the worker thread exits — exactly what
+    we must avoid when the LLM API stalls indefinitely.
     """
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(agent.run, prompt)
-    try:
-        return future.result(timeout=timeout_seconds)
-    except concurrent.futures.TimeoutError:
-        raise TimeoutError(
-            f"Agent call exceeded {timeout_seconds // 60}m timeout"
-        )
-    finally:
-        executor.shutdown(wait=False)
+    result_holder: list = [None]
+    exc_holder: list = [None]
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            result_holder[0] = agent.run(prompt)
+        except Exception as exc:  # noqa: BLE001
+            exc_holder[0] = exc
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    if not done.wait(timeout=timeout_seconds):
+        raise TimeoutError(f"Agent call exceeded {timeout_seconds // 60}m timeout")
+
+    if exc_holder[0] is not None:
+        raise exc_holder[0]
+    return result_holder[0]
 
 
 class PipelineOrchestrator:
@@ -75,6 +113,8 @@ class PipelineOrchestrator:
         repo_path = run_dir / "repo"
         env = None
         engine = None
+        runtime_engine = None
+        exploit_engine = None
 
         try:
             # 1. Clone
@@ -112,8 +152,82 @@ class PipelineOrchestrator:
                 return state
 
             _step(f"[green]Build succeeded[/green] (attempt {len(state.build_attempts)})")
+            self._save(state, run_dir)
 
-            # 5. Initial scan
+            # 5. Package — produce the fat JAR needed by the runtime engine.
+            # Compile only produces .class files; package runs the spring-boot-maven-plugin
+            # (or Gradle bootJar) to repackage them into a runnable fat JAR.
+            runtime_enabled = self._config.enable_runtime
+            if runtime_enabled:
+                _step("[bold]Packaging application[/bold] (producing runnable JAR)...")
+                package_result = engine.run_phase(BuildPhase.PACKAGE, timeout_seconds=15 * 60)
+                if not package_result.success:
+                    _step("[yellow]Packaging failed — skipping runtime engine[/yellow]")
+                    runtime_enabled = False
+                else:
+                    _step("[green]Package succeeded[/green]")
+
+            # 6. Runtime engine — attempt to start the service and confirm it responds
+            if runtime_enabled:
+                runtime_engine = RuntimeEngine(repo_path, language, image)
+                if runtime_engine.detect():
+                    _step("[bold]Runtime engine:[/bold] web service detected — attempting startup...")
+                    runtime_result = runtime_engine.start(
+                        timeout_seconds=self._config.runtime_startup_timeout_seconds
+                    )
+                    state.runtime_result = runtime_result
+                    self._save(state, run_dir)
+
+                    if runtime_result.status == RuntimeStatus.STARTED:
+                        stubs = (
+                            f"  stubs: {', '.join(runtime_result.stubs_applied)}"
+                            if runtime_result.stubs_applied else ""
+                        )
+                        deps = (
+                            f"  deps: {', '.join(runtime_result.deps_provisioned)}"
+                            if runtime_result.deps_provisioned else ""
+                        )
+                        _step(
+                            f"[green]Service started[/green] ({runtime_result.service_type.value}) "
+                            f"on :{runtime_result.port} via {runtime_result.healthy_path} "
+                            f"in {runtime_result.startup_seconds:.0f}s "
+                            f"[strategy: {runtime_result.startup_strategy}]{stubs}{deps}"
+                        )
+
+                        # Phase 2b: surface discovery
+                        _step("[bold]Surface discovery...[/bold]")
+                        disc = SurfaceDiscovery(runtime_result.base_url, repo_path)
+                        surface = disc.discover()
+                        state.surface = surface
+                        self._save(state, run_dir)
+                        if surface.discovery_source == "none":
+                            _step("[dim]Surface discovery: no actuator or OpenAPI endpoint found[/dim]")
+                        else:
+                            _step(
+                                f"[bold]Surface:[/bold] {len(surface.endpoints)} endpoint(s) "
+                                f"via {surface.discovery_source} "
+                                f"({surface.mapped_to_source} mapped to source)"
+                            )
+
+                        # Phase 2c: exploit engine (opt-in)
+                        if self._config.enable_exploit_engine and surface.discovery_source != "none":
+                            _step("[bold]Exploit engine:[/bold] probing for exploitable findings...")
+                            exploit_engine = ExploitEngine(
+                                base_url=runtime_result.base_url,
+                                repo_path=repo_path,
+                                runtime_result=runtime_result,
+                                model_id=self._config.exploit_model,
+                                provider=self._config.exploit_provider,
+                            )
+                    else:
+                        _step(
+                            f"[yellow]Service did not start[/yellow] "
+                            f"({runtime_result.status.value}) — continuing without runtime"
+                        )
+                else:
+                    _step("[dim]Runtime engine: no runnable web service detected[/dim]")
+
+            # 6. Initial scan
             _step("[bold]Running scanners...[/bold]")
             build_file = "build.gradle" if language == Language.JAVA_GRADLE else "pom.xml"
             scanner = ScannerOrchestrator(self._config.enabled_scanners, build_file=build_file, language=language.value)
@@ -140,46 +254,27 @@ class PipelineOrchestrator:
                 self._save(state, run_dir)
                 return state
 
-            # 6. Remediation loop — one (rule_id, file_path) group at a time
+            # Phase 2c: probe (after scan, before remediation)
+            if exploit_engine is not None:
+                try:
+                    state.probe_results = exploit_engine.probe(state.surface, findings)
+                    exploitable = sum(1 for r in state.probe_results if r.status.value == "exploitable")
+                    _step(
+                        f"[bold]Exploit engine:[/bold] {exploitable}/{len(state.probe_results)} "
+                        f"finding(s) confirmed exploitable"
+                    )
+                    self._save(state, run_dir)
+                except Exception as exc:
+                    _step(f"[yellow]Exploit engine error — skipping: {exc}[/yellow]")
+                    logger.exception("ExploitEngine.probe failed")
+
+            # 7. Remediation loop — one (rule_id, file_path) group at a time
             remediation_trace_path = run_dir / "llm-remediation-agent.md"
             init_log(remediation_trace_path, "Remediation Agent", state.run_id, state.repo_url)
             remediation_agent = create_remediation_agent(
                 repo_path, self._config.llm_model, self._config.llm_provider, env,
                 language=language,
             )
-
-            priority_order = ["critical", "high", "medium", "low", "info"]
-
-            def _finding_priority(f: ScanFinding) -> int:
-                return priority_order.index(f.severity.value)
-
-            # Scanner order: Trivy CVEs (version bumps) are highest-confidence fixes → first.
-            # Gitleaks secrets next, then Semgrep SAST which requires deeper code understanding.
-            _scanner_order = {ScannerType.TRIVY: 0, ScannerType.GITLEAKS: 1, ScannerType.SEMGREP: 2}
-
-            def _group_priority(group: list[ScanFinding]) -> tuple:
-                sev = min(_finding_priority(f) for f in group)
-                scanner = _scanner_order.get(group[0].scanner, 9)
-                return (sev, scanner)
-
-            # Paths excluded from remediation — non-source files the agent can't fix reliably.
-            # Prefix list: CI/CD configs and infra-as-code directories.
-            # Suffix list: file types that are never application source code (data, docs, infra,
-            # shell scripts). Findings in these files are intentional (CTF apps, test fixtures)
-            # or infrastructure — patching them is meaningless and wastes iteration budget.
-            _EXCLUDED_PREFIXES = (".github/", ".gitlab-ci", ".circleci/")
-            _EXCLUDED_SUFFIXES = (
-                ".tf",             # Terraform — infrastructure, not application code
-                ".md", ".adoc", ".rst",  # documentation
-                ".txt", ".csv", ".sql",  # data files
-                ".sh", ".bash",    # shell scripts
-            )
-
-            def _is_excluded(file_path: str) -> bool:
-                return (
-                    any(file_path.startswith(p) for p in _EXCLUDED_PREFIXES)
-                    or any(file_path.endswith(s) for s in _EXCLUDED_SUFFIXES)
-                )
 
             # Group findings by (rule_id, file_path) — all instances of a pattern in one file
             # are fixed together in a single agent call. Preserves priority order.
@@ -338,6 +433,18 @@ class PipelineOrchestrator:
             else:
                 state.status = RunStatus.MAX_ITERATIONS
 
+            # Phase 2c: confirm patches eliminated exploit paths
+            if exploit_engine is not None and state.probe_results:
+                try:
+                    _step("[bold]Exploit engine:[/bold] confirming patches...")
+                    state.probe_results = exploit_engine.confirm(state.probe_results, state.findings)
+                    fixed = sum(1 for r in state.probe_results if r.confirmed_fixed is True)
+                    _step(f"[bold]Exploit engine:[/bold] {fixed}/{len(state.probe_results)} exploit path(s) confirmed fixed")
+                    self._save(state, run_dir)
+                except Exception as exc:
+                    _step(f"[yellow]Exploit engine confirm error — skipping: {exc}[/yellow]")
+                    logger.exception("ExploitEngine.confirm failed")
+
             # Final test health check — runs unit tests (no integration tests), with a hard timeout
             if env and state.status != RunStatus.BUILD_FAILED:
                 timeout_s = self._config.final_test_timeout_minutes * 60
@@ -362,8 +469,10 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.exception("[ASEL] Unexpected error: %s", e)
             if state.status == RunStatus.RUNNING:
-                state.status = RunStatus.BUILD_FAILED
+                state.status = RunStatus.PARTIAL
         finally:
+            if runtime_engine:
+                runtime_engine.stop()
             if env:
                 env.stop()
             state.completed_at = state.completed_at or datetime.now(timezone.utc)
@@ -395,7 +504,7 @@ class PipelineOrchestrator:
             try:
                 run_output = _run_agent_with_timeout(agent, prompt, BUILD_AGENT_TIMEOUT_SECONDS)
             except TimeoutError as exc:
-                _step(f"  [yellow]BuildAgent timed out ({BUILD_AGENT_TIMEOUT_SECONDS // 60}m) — continuing without fix[/yellow]")
+                print(f"  BuildAgent timed out ({BUILD_AGENT_TIMEOUT_SECONDS // 60}m) — continuing without fix")
                 run_output = str(exc)
             append_turn(trace_path, label=f"Build stabilization — attempt {attempt} ({phase_label})", prompt=prompt, run_output=run_output)
 
@@ -474,7 +583,7 @@ class PipelineOrchestrator:
         try:
             run_output = _run_agent_with_timeout(remediation_agent, prompt, REMEDIATION_AGENT_TIMEOUT_SECONDS)
         except Exception as exc:
-            _step(f"  [red]Agent error — rolling back:[/red] {exc}")
+            print(f"  Agent error — rolling back: {exc}")
             exc_result = BuildResult(success=False, phase=BuildPhase.COMPILE, output=str(exc), duration_seconds=0)
             return self._fail_iteration(state, iteration, prev_findings, exc_result, repo_path, targets)
         append_turn(
@@ -525,7 +634,7 @@ class PipelineOrchestrator:
                 try:
                     repair_output = _run_agent_with_timeout(remediation_agent, repair_prompt, REMEDIATION_AGENT_TIMEOUT_SECONDS)
                 except Exception as exc:
-                    _step(f"  [red]Repair agent error — rolling back:[/red] {exc}")
+                    print(f"  Repair agent error — rolling back: {exc}")
                     return self._fail_iteration(state, iteration, prev_findings, build_result, repo_path, targets)
                 append_turn(
                     trace_path,
@@ -550,8 +659,8 @@ class PipelineOrchestrator:
         build_file = "build.gradle" if language == Language.JAVA_GRADLE else "pom.xml"
         rescan = ScannerOrchestrator([rep.scanner], build_file=build_file, language=language.value)
         fresh = rescan.run(repo_path)
-        if rescan.had_timeout:
-            _step(f"  [yellow]{rep.scanner.value} timed out — keeping previous findings[/yellow]")
+        if rescan.had_timeout or rescan.had_failure:
+            _step(f"  [yellow]{rep.scanner.value} failed/timed out on rescan — keeping previous findings[/yellow]")
             fresh = [f for f in prev_findings if f.scanner == rep.scanner]
         # Merge: fresh results from the target scanner + all other scanners unchanged
         other_findings = [f for f in prev_findings if f.scanner != rep.scanner]

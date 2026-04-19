@@ -28,6 +28,9 @@ def run(
     final_test_timeout: int = typer.Option(5, help="Minutes before killing the final unit test run"),
     model: str = typer.Option("deepseek-chat", help="LLM model identifier"),
     provider: str = typer.Option("deepseek", help="LLM provider (deepseek, openai, anthropic)"),
+    exploit_engine: bool = typer.Option(False, "--exploit-engine", help="Enable agentic DAST (adds significant runtime)"),
+    exploit_model: Optional[str] = typer.Option(None, help="Model for exploit engine (defaults to --model)"),
+    exploit_provider: Optional[str] = typer.Option(None, help="Provider for exploit engine (defaults to --provider)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show debug logs"),
 ) -> None:
     """Clone, build, scan, and remediate a Java/Maven repository."""
@@ -50,6 +53,9 @@ def run(
         final_test_timeout_minutes=final_test_timeout,
         llm_model=model,
         llm_provider=provider,
+        enable_exploit_engine=exploit_engine,
+        exploit_model=exploit_model or model,
+        exploit_provider=exploit_provider or provider,
     )
 
     orchestrator = PipelineOrchestrator(config)

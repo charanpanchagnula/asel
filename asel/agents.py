@@ -20,16 +20,19 @@ def _tail(text: str, max_lines: int = _MAX_OUTPUT_LINES) -> str:
     return f"[... {len(lines) - max_lines} lines truncated ...]\n" + "\n".join(lines[-max_lines:])
 
 
+_LLM_REQUEST_TIMEOUT = 600.0  # 10-min hard cap per LLM HTTP call (prevents indefinite API hangs)
+
+
 def _make_model(model_id: str, provider: str):
     if provider == "deepseek":
         from agno.models.deepseek import DeepSeek
-        return DeepSeek(id=model_id)
+        return DeepSeek(id=model_id, timeout=_LLM_REQUEST_TIMEOUT)
     if provider == "openai":
         from agno.models.openai import OpenAIChat
-        return OpenAIChat(id=model_id)
+        return OpenAIChat(id=model_id, timeout=_LLM_REQUEST_TIMEOUT)
     if provider == "anthropic":
         from agno.models.anthropic import Claude
-        return Claude(id=model_id)
+        return Claude(id=model_id, timeout=_LLM_REQUEST_TIMEOUT)
     raise ValueError(f"Unknown LLM provider: {provider}")
 
 
@@ -121,25 +124,6 @@ def _make_file_tools(repo_path: Path) -> list:
         return f"Created {path}"
 
     @tool
-    def read_file_lines(path: str, start_line: int, end_line: int) -> str:
-        """Read a specific range of lines from a file (1-indexed, inclusive).
-        Use this to read a section of a large file without loading all of it.
-        Example: read_file_lines('pom.xml', 1, 50) reads the first 50 lines.
-        """
-        full = _safe_resolve(path)
-        if full is None:
-            return f"Blocked: {path} escapes the repository boundary"
-        if not full.exists():
-            return f"File not found: {path}"
-        lines = full.read_text().splitlines()
-        total = len(lines)
-        s = max(0, start_line - 1)
-        e = min(total, end_line)
-        selected = lines[s:e]
-        header = f"[Lines {s+1}-{s+len(selected)} of {total}]\n"
-        return header + "\n".join(selected)
-
-    @tool
     def grep_file(path: str, pattern: str, context_lines: int = 3) -> str:
         """Search for a pattern in a file and return matching lines with context.
         Use this to locate the exact text to pass as old_text in edit_file.
@@ -154,10 +138,18 @@ def _make_file_tools(repo_path: Path) -> list:
         if full.is_dir():
             return f"Path is a directory: {path} — provide a specific file path"
         lines = full.read_text().splitlines()
+        try:
+            re.compile(pattern)
+            def _matches(line: str) -> bool:
+                return bool(re.search(pattern, line, re.IGNORECASE))
+        except re.error:
+            pat_lower = pattern.lower()
+            def _matches(line: str) -> bool:
+                return pat_lower in line.lower()
         results = []
         emitted_up_to = -1  # last line index already included in output
         for i, line in enumerate(lines):
-            if re.search(pattern, line, re.IGNORECASE):
+            if _matches(line):
                 lo = max(emitted_up_to + 1, i - context_lines)
                 hi = min(len(lines), i + context_lines + 1)
                 block = "\n".join(f"{j+1}: {lines[j]}" for j in range(lo, hi))
@@ -185,7 +177,7 @@ def _make_file_tools(repo_path: Path) -> list:
         )
         return "\n".join(files)
 
-    return [read_file, read_file_lines, grep_file, edit_file, create_file, list_files]
+    return [read_file, grep_file, edit_file, create_file, list_files]
 
 
 _BUILD_INSTRUCTIONS: dict[Language, str] = {
@@ -194,7 +186,7 @@ You are a Maven build repair expert. Your job is to fix build failures in Java/M
 
 Available tools:
 - read_file(path)                        — read a file (truncated at 8000 chars for large files)
-- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- read_file(path, start_line, end_line)  — read a specific line range (1-indexed, inclusive)
 - grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
 - edit_file(path, old_text, new_text)    — replace EXACT text in an existing file
 - create_file(path, content)             — create a new file that does not yet exist
@@ -221,7 +213,7 @@ You are a Gradle build repair expert. Your job is to fix build failures in Java/
 
 Available tools:
 - read_file(path)                        — read a file (truncated at 8000 chars for large files)
-- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- read_file(path, start_line, end_line)  — read a specific line range (1-indexed, inclusive)
 - grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
 - edit_file(path, old_text, new_text)    — replace EXACT text in an existing file
 - create_file(path, content)             — create a new file that does not yet exist
@@ -256,7 +248,7 @@ whatever language they appear in — use your knowledge of that language's secur
 
 Available tools:
 - read_file(path)                        — read a file (truncated at 8000 chars for large files)
-- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- read_file(path, start_line, end_line)  — read a specific line range (1-indexed, inclusive)
 - grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
 - edit_file(path, old_text, new_text)    — replace EXACT text in a file (surgical edit only)
 - create_file(path, content)             — create a new file
@@ -274,7 +266,7 @@ Workflow for a Trivy CVE (dependency version bump in pom.xml):
 3. run_maven_compile() to verify
 
 Workflow for a Semgrep finding in any language file:
-1. read_file or read_file_lines to see the flagged code
+1. read_file (with optional start_line/end_line) to see the flagged code
 2. edit_file with the minimal fix appropriate for that language
 3. run_maven_compile() if the fix touches JVM source files; skip compile check for non-JVM files
 
@@ -290,7 +282,7 @@ whatever language they appear in — use your knowledge of that language's secur
 
 Available tools:
 - read_file(path)                        — read a file (truncated at 8000 chars for large files)
-- read_file_lines(path, start, end)      — read a specific line range (1-indexed, inclusive)
+- read_file(path, start_line, end_line)  — read a specific line range (1-indexed, inclusive)
 - grep_file(path, pattern, context=3)    — find a pattern and see surrounding lines
 - edit_file(path, old_text, new_text)    — replace EXACT text in a file (surgical edit only)
 - create_file(path, content)             — create a new file
@@ -308,7 +300,7 @@ Workflow for a Trivy CVE (dependency version bump in build.gradle / build.gradle
 3. run_gradle_compile() to verify
 
 Workflow for a Semgrep finding in any language file:
-1. read_file or read_file_lines to see the flagged code
+1. read_file (with optional start_line/end_line) to see the flagged code
 2. edit_file with the minimal fix appropriate for that language
 3. run_gradle_compile() if the fix touches JVM source files; skip compile check for non-JVM files
 

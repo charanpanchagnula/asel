@@ -18,7 +18,11 @@ class ExecutionEnvironment:
         self._container = self._client.containers.run(
             self.image,
             command=["tail", "-f", "/dev/null"],  # keep alive
-            volumes={str(self.repo_path): {"bind": "/workspace", "mode": "rw"}},
+            volumes={
+                str(self.repo_path): {"bind": "/workspace", "mode": "rw"},
+                "asel-maven-cache": {"bind": "/root/.m2", "mode": "rw"},
+                "asel-gradle-cache": {"bind": "/root/.gradle", "mode": "rw"},
+            },
             working_dir="/workspace",
             detach=True,
             mem_limit="2g",

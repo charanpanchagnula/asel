@@ -11,6 +11,7 @@ from .models import BuildResult, BuildPhase, ErrorCategory, Language
 PHASE_COMMANDS: dict[BuildPhase, list[str]] = {
     BuildPhase.DEPENDENCY_RESOLVE: ["mvn", "dependency:resolve", "--batch-mode"],
     BuildPhase.COMPILE:            ["mvn", "compile", "-DskipTests", "--batch-mode"],
+    BuildPhase.PACKAGE:            ["mvn", "package", "-DskipTests", "--batch-mode"],
     BuildPhase.UNIT_TEST:          ["mvn", "test", "-DskipITs", "--batch-mode"],
     BuildPhase.FULL_BUILD:         ["mvn", "clean", "install", "--batch-mode"],
 }
@@ -30,17 +31,36 @@ class BuildEngine(ABC):
         ...
 
 
-def categorize_error(output: str) -> ErrorCategory:
-    """Classify a Maven build failure from its output."""
+def categorize_build_error(output: str) -> ErrorCategory:
+    """Classify a JVM build failure (Maven or Gradle) from its output.
+
+    Priority order matters: network before plugin, plugin before generic dep.
+    """
     lower = output.lower()
-    if "could not resolve" in lower or ("artifact" in lower and "not found" in lower):
+    # 1. Network failures first — "failed to execute goal" can appear in INFO download
+    #    lines and would otherwise trigger the plugin check below.
+    if any(p in lower for p in ("could not transfer", "failed to respond",
+                                 "network is unreachable", "could not collect")):
         return ErrorCategory.DEPENDENCY_CONFLICT
-    if "cannot find symbol" in lower or "does not compile" in lower:
+    # 2. Plugin missing — Gradle surfaces this before the generic dep error
+    if "plugin" in lower and any(p in lower for p in ("not found", "could not resolve")):
+        return ErrorCategory.PLUGIN_INCOMPATIBILITY
+    # 3. Generic dependency resolution failure
+    if "could not resolve" in lower or (
+        any(kw in lower for kw in ("artifact", "dependency")) and "not found" in lower
+    ):
+        return ErrorCategory.DEPENDENCY_CONFLICT
+    # 4. Compile errors
+    if any(p in lower for p in ("cannot find symbol", "does not compile", "compilation failed")):
         return ErrorCategory.COMPILE_ERROR
-    if "source release" in lower or "target release" in lower:
+    # 5. Java version mismatch
+    if any(p in lower for p in ("source release", "target release",
+                                  "source compatibility", "class file version")):
         return ErrorCategory.JAVA_VERSION_MISMATCH
-    if "tests run:" in lower and "failure" in lower:
+    # 6. Test failures
+    if ("tests run:" in lower and "failure" in lower) or "tests failed" in lower:
         return ErrorCategory.TEST_FAILURE
+    # 7. Maven plugin execution failure (more specific than the generic plugin check above)
     if "failed to execute goal" in lower and "plugin" in lower:
         return ErrorCategory.PLUGIN_INCOMPATIBILITY
     return ErrorCategory.UNKNOWN
@@ -74,7 +94,7 @@ class MavenBuildEngine(BuildEngine):
             phase=phase,
             output=output,
             duration_seconds=round(duration, 2),
-            error_category=None if success else categorize_error(output),
+            error_category=None if success else categorize_build_error(output),
         )
 
 

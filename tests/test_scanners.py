@@ -3,8 +3,8 @@ import json
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
-from asel.scanners import SemgrepScanner, TrivyScanner, GitleaksScanner, ScannerOrchestrator
-from asel.models import ScannerType, Severity
+from asel.scanners import SemgrepScanner, TrivyScanner, ScannerOrchestrator
+from asel.models import ScanFinding, ScannerType, Severity
 
 
 SEMGREP_OUTPUT = json.dumps({
@@ -34,24 +34,8 @@ TRIVY_OUTPUT = json.dumps({
     }]
 }).encode()
 
-GITLEAKS_OUTPUT = json.dumps([{
-    "RuleID": "aws-access-token",
-    "File": "config/settings.properties",
-    "StartLine": 5,
-    "Description": "AWS Access Token",
-    "Secret": "AKIAIOSFODNN7EXAMPLE",
-}]).encode()
-
-
-def mock_docker_run(output: bytes):
-    """Mock for Semgrep/Trivy — containers.run() returns bytes directly."""
-    mock = MagicMock()
-    mock.containers.run.return_value = output
-    return mock
-
 
 def mock_docker_run_detached(output: bytes, exit_code: int = 0):
-    """Mock for Gitleaks — containers.run(detach=True) returns a container object."""
     container = MagicMock()
     container.wait.return_value = {"StatusCode": exit_code}
     container.logs.return_value = output
@@ -60,8 +44,12 @@ def mock_docker_run_detached(output: bytes, exit_code: int = 0):
     return mock
 
 
+@pytest.fixture
+def tmp_repo(tmp_path):
+    return tmp_path
+
+
 def test_semgrep_parses_findings(tmp_repo):
-    # semgrep exits 1 when findings are present (normal), 0 when none
     with patch("asel.scanners.docker.from_env", return_value=mock_docker_run_detached(SEMGREP_OUTPUT, exit_code=1)):
         findings = SemgrepScanner().run(tmp_repo)
     assert len(findings) == 1
@@ -82,29 +70,7 @@ def test_trivy_parses_findings(tmp_repo):
     assert findings[0].title == "Log4Shell"
 
 
-def test_gitleaks_parses_findings(tmp_repo):
-    with patch("asel.scanners.docker.from_env", return_value=mock_docker_run_detached(GITLEAKS_OUTPUT, exit_code=1)):
-        findings = GitleaksScanner().run(tmp_repo)
-    assert len(findings) == 1
-    assert findings[0].scanner == ScannerType.GITLEAKS
-    assert findings[0].rule_id == "aws-access-token"
-    assert findings[0].severity == Severity.CRITICAL
-
-
-def test_gitleaks_returns_empty_when_no_findings(tmp_repo):
-    with patch("asel.scanners.docker.from_env", return_value=mock_docker_run_detached(b"", exit_code=0)):
-        findings = GitleaksScanner().run(tmp_repo)
-    assert findings == []
-
-
-def test_gitleaks_returns_empty_on_error(tmp_repo):
-    with patch("asel.scanners.docker.from_env", return_value=mock_docker_run_detached(b"", exit_code=2)):
-        findings = GitleaksScanner().run(tmp_repo)
-    assert findings == []
-
-
 def test_scanner_raises_on_error(tmp_repo):
-    """Non-timeout exceptions propagate so the orchestrator can handle them."""
     with patch("asel.scanners.docker.from_env") as mock_docker:
         mock_docker.return_value.containers.run.side_effect = Exception("container failed")
         with pytest.raises(Exception, match="container failed"):
@@ -112,16 +78,12 @@ def test_scanner_raises_on_error(tmp_repo):
 
 
 def test_orchestrator_aggregates_all_scanners(tmp_repo):
-    # Patch each scanner's run() with pre-built findings — thread-safe for parallel execution.
-    from asel.models import ScanFinding, Severity
     semgrep_f = ScanFinding(scanner=ScannerType.SEMGREP, severity=Severity.HIGH, rule_id="r1", file_path="f.java", title="t", description="d")
     trivy_f = ScanFinding(scanner=ScannerType.TRIVY, severity=Severity.CRITICAL, rule_id="CVE-1", file_path="pom.xml", title="t", description="d")
-    gitleaks_f = ScanFinding(scanner=ScannerType.GITLEAKS, severity=Severity.CRITICAL, rule_id="aws-key", file_path="app.properties", title="t", description="d")
 
     with patch.object(SemgrepScanner, "run", return_value=[semgrep_f]), \
-         patch.object(TrivyScanner, "run", return_value=[trivy_f]), \
-         patch.object(GitleaksScanner, "run", return_value=[gitleaks_f]):
-        orchestrator = ScannerOrchestrator(enabled=[ScannerType.SEMGREP, ScannerType.TRIVY, ScannerType.GITLEAKS])
+         patch.object(TrivyScanner, "run", return_value=[trivy_f]):
+        orchestrator = ScannerOrchestrator(enabled=[ScannerType.SEMGREP, ScannerType.TRIVY])
         findings = orchestrator.run(tmp_repo)
-    assert len(findings) == 3
-    assert {f.scanner for f in findings} == {ScannerType.SEMGREP, ScannerType.TRIVY, ScannerType.GITLEAKS}
+    assert len(findings) == 2
+    assert {f.scanner for f in findings} == {ScannerType.SEMGREP, ScannerType.TRIVY}

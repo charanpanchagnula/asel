@@ -23,40 +23,31 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
+
 ASEL_ROOT = Path(__file__).parent.parent
 RUNS_ROOT = ASEL_ROOT / "asel-runs"
 WIKI_ROOT = ASEL_ROOT.parent / "asel-wiki"
 INGEST_SCRIPT = ASEL_ROOT / "scripts" / "wiki_ingest.py"
 CAPTURE_SCRIPT = ASEL_ROOT / "scripts" / "benchmark_capture.py"
+REPOS_FILE = ASEL_ROOT / "benchmark_repos.yaml"
 
 # ---------------------------------------------------------------------------
-# Benchmark repo registry
+# Benchmark repo registry — loaded from benchmark_repos.yaml
 # ---------------------------------------------------------------------------
 # Format: (url, build_tool, short_name, tier)
-BENCHMARK_REPOS = [
-    # Tier 1 — core benchmark
-    ("https://github.com/OWASP-Benchmark/BenchmarkJava",    "maven",  "BenchmarkJava",               1),
-    ("https://github.com/WebGoat/WebGoat",                  "gradle", "WebGoat",                     1),
-    ("https://github.com/SasanLabs/VulnerableApp",          "gradle", "VulnerableApp",               1),
-    ("https://github.com/OWASP/wrongsecrets",               "maven",  "wrongsecrets",                1),
-    ("https://github.com/appsecco/dvja",                    "maven",  "dvja",                        1),
-    # Tier 2 — supplemental
-    ("https://github.com/DataDog/vulnerable-java-application", "gradle", "vulnerable-java-application", 2),
-    # Tier 3 — Vul4J corpus (real OSS projects with known CVEs, for paper benchmarking)
-    # Sourced from tuhh-softsec/vul4j — repos with multiple CVEs prioritised
-    ("https://github.com/apache/struts",                       "maven",  "apache-struts",               3),
-    ("https://github.com/apache/commons-compress",             "maven",  "commons-compress",            3),
-    ("https://github.com/spring-projects/spring-framework",    "gradle", "spring-framework",            3),
-    ("https://github.com/spring-projects/spring-security",     "gradle", "spring-security",             3),
-    ("https://github.com/apache/camel",                        "maven",  "apache-camel",                3),
-    ("https://github.com/FasterXML/jackson-dataformat-xml",    "maven",  "jackson-dataformat-xml",      3),
-    ("https://github.com/apache/commons-fileupload",           "maven",  "commons-fileupload",          3),
-    ("https://github.com/jhy/jsoup",                           "maven",  "jsoup",                       3),
-    ("https://github.com/alibaba/fastjson",                    "maven",  "fastjson",                    3),
-    ("https://github.com/apache/shiro",                        "maven",  "apache-shiro",                3),
-    ("https://github.com/x-stream/xstream",                    "maven",  "xstream",                    3),
-    ("https://github.com/ESAPI/esapi-java-legacy",             "maven",  "esapi-java-legacy",           3),
-]
+
+def _load_repos() -> list[tuple[str, str, str, int]]:
+    """Load repo list from benchmark_repos.yaml."""
+    if yaml is None:
+        raise SystemExit("PyYAML not installed. Run: uv add pyyaml")
+    data = yaml.safe_load(REPOS_FILE.read_text())
+    return [(r["url"], r["build"], r["name"], r["tier"]) for r in data["repos"]]
+
+BENCHMARK_REPOS = _load_repos()
 
 
 def _already_run(repo_url: str) -> str | None:
@@ -123,14 +114,19 @@ def main() -> None:
     parser.add_argument("--provider", default="deepseek", help="LLM provider")
     parser.add_argument("--force", action="store_true", help="Re-run repos that already have completed runs")
     parser.add_argument("--dry-run", action="store_true", help="Print plan without running anything")
+    parser.add_argument("--name", help="Comma-separated repo names to run (e.g. eladmin,mall-tiny)")
     args = parser.parse_args()
 
-    # Filter repos by tier
+    # Filter repos by tier then optionally by name
     if args.tier == "all":
         repos = BENCHMARK_REPOS
     else:
         tier = int(args.tier)
         repos = [r for r in BENCHMARK_REPOS if r[3] == tier]
+
+    if args.name:
+        names = {n.strip().lower() for n in args.name.split(",")}
+        repos = [r for r in repos if r[2].lower() in names]
 
     session_start = datetime.now(timezone.utc)
     session_log: list[dict] = []

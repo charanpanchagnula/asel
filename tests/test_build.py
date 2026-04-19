@@ -1,6 +1,6 @@
 # tests/test_build.py
 from unittest.mock import MagicMock
-from asel.build import MavenBuildEngine, categorize_error
+from asel.build import MavenBuildEngine, categorize_build_error as categorize_error
 from asel.models import BuildPhase, ErrorCategory
 
 
@@ -42,6 +42,11 @@ def test_categorize_test_failure():
     assert categorize_error(output) == ErrorCategory.TEST_FAILURE
 
 
+def test_categorize_maven_plugin_execution_failure():
+    output = "Failed to execute goal org.springframework.boot:spring-boot-maven-plugin:3.0.0:repackage"
+    assert categorize_error(output) == ErrorCategory.PLUGIN_INCOMPATIBILITY
+
+
 def test_progressive_phases_order():
     engine = MavenBuildEngine(MagicMock())
     phases = engine.progressive_phases()
@@ -77,7 +82,8 @@ def test_create_engine_raises_for_unknown_language():
             create_engine(Language.AUTO_DETECT, MagicMock(), Path(d))
 
 
-from asel.build_gradle import GradleBuildEngine, categorize_gradle_error
+from asel.build_gradle import GradleBuildEngine
+from asel.build import categorize_build_error as categorize_gradle_error
 
 
 def test_gradle_engine_implements_build_engine():

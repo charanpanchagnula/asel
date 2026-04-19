@@ -2,25 +2,9 @@
 import time
 from pathlib import Path
 
-from .build import BuildEngine
+from .build import BuildEngine, categorize_build_error
 from .environment import ExecutionEnvironment
 from .models import BuildResult, BuildPhase, ErrorCategory
-
-
-def categorize_gradle_error(output: str) -> ErrorCategory:
-    """Classify a Gradle build failure from its output."""
-    lower = output.lower()
-    if "plugin" in lower and ("not found" in lower or "could not resolve" in lower):
-        return ErrorCategory.PLUGIN_INCOMPATIBILITY
-    if "could not resolve" in lower or ("dependency" in lower and "not found" in lower):
-        return ErrorCategory.DEPENDENCY_CONFLICT
-    if "cannot find symbol" in lower or "compilation failed" in lower:
-        return ErrorCategory.COMPILE_ERROR
-    if "source compatibility" in lower or "class file version" in lower:
-        return ErrorCategory.JAVA_VERSION_MISMATCH
-    if "tests failed" in lower or ("test" in lower and "failed" in lower and "build failed" in lower):
-        return ErrorCategory.TEST_FAILURE
-    return ErrorCategory.UNKNOWN
 
 
 class GradleBuildEngine(BuildEngine):
@@ -28,6 +12,7 @@ class GradleBuildEngine(BuildEngine):
     _TASKS: dict[BuildPhase, list[str]] = {
         BuildPhase.DEPENDENCY_RESOLVE: ["dependencies"],
         BuildPhase.COMPILE:            ["compileJava"],
+        BuildPhase.PACKAGE:            ["bootJar", "-x", "test", "-x", "spotlessCheck"],
         BuildPhase.UNIT_TEST:          ["test"],
         BuildPhase.FULL_BUILD:         ["build"],
     }
@@ -55,5 +40,5 @@ class GradleBuildEngine(BuildEngine):
             phase=phase,
             output=output,
             duration_seconds=round(duration, 2),
-            error_category=None if success else categorize_gradle_error(output),
+            error_category=None if success else categorize_build_error(output),
         )

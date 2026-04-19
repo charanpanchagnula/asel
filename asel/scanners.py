@@ -97,7 +97,12 @@ class SemgrepScanner(BaseScanner):
             timer = threading.Timer(_SEMGREP_TIMEOUT_SECS, _kill)
             timer.start()
             try:
-                exit_info = container.wait()
+                try:
+                    exit_info = container.wait(timeout=_SEMGREP_TIMEOUT_SECS + 60)
+                except Exception:
+                    if timed_out.is_set():
+                        raise ScannerTimeoutError("semgrep", _SEMGREP_TIMEOUT_SECS)
+                    raise
                 if timed_out.is_set():
                     raise ScannerTimeoutError("semgrep", _SEMGREP_TIMEOUT_SECS)
                 exit_code = exit_info["StatusCode"]
@@ -158,8 +163,11 @@ class TrivyScanner(BaseScanner):
         try:
             container = client.containers.run(
                 "ghcr.io/aquasecurity/trivy:latest",
-                command=["fs", "--format", "json", "/workspace"],
-                volumes={str(repo_path.resolve()): {"bind": "/workspace", "mode": "ro"}},
+                command=["fs", "--format", "json", "--quiet", "/workspace"],
+                volumes={
+                    str(repo_path.resolve()): {"bind": "/workspace", "mode": "ro"},
+                    "asel-trivy-cache": {"bind": "/root/.cache/trivy", "mode": "rw"},
+                },
                 detach=True,
             )
 
@@ -173,7 +181,12 @@ class TrivyScanner(BaseScanner):
             timer = threading.Timer(_TRIVY_TIMEOUT_SECS, _kill)
             timer.start()
             try:
-                exit_info = container.wait()
+                try:
+                    exit_info = container.wait(timeout=_TRIVY_TIMEOUT_SECS + 60)
+                except Exception:
+                    if timed_out.is_set():
+                        raise ScannerTimeoutError("trivy", _TRIVY_TIMEOUT_SECS)
+                    raise
             finally:
                 timer.cancel()
 
@@ -181,7 +194,7 @@ class TrivyScanner(BaseScanner):
                 raise ScannerTimeoutError("trivy", _TRIVY_TIMEOUT_SECS)
 
             exit_code = exit_info["StatusCode"]
-            if exit_code != 0:
+            if exit_code not in (0, 1):  # 1 = vulnerabilities found (normal)
                 raise RuntimeError(f"trivy exited with code {exit_code}")
             output = container.logs(stdout=True, stderr=False)
             data = json.loads(output)
@@ -218,62 +231,11 @@ class TrivyScanner(BaseScanner):
         )
 
 
-class GitleaksScanner(BaseScanner):
-    name = ScannerType.GITLEAKS
-
-    def run(self, repo_path: Path) -> list[ScanFinding]:
-        client = docker.from_env()
-        container = None
-        try:
-            # Run detached so we can retrieve logs regardless of exit code.
-            # Gitleaks exits 0 = no findings, 1 = findings found, >1 = error.
-            container = client.containers.run(
-                "ghcr.io/gitleaks/gitleaks:latest",
-                command=["detect", "--source", "/path", "--report-format", "json",
-                         "--report-path", "/dev/stdout", "--no-git"],
-                volumes={str(repo_path.resolve()): {"bind": "/path", "mode": "ro"}},
-                detach=True,
-            )
-            exit_info = container.wait()
-            exit_code = exit_info["StatusCode"]
-            if exit_code > 1:
-                raise RuntimeError(f"gitleaks exited with code {exit_code}")
-            output = container.logs(stdout=True, stderr=False)
-            if not output or not output.strip():
-                return []
-            data = json.loads(output)
-            return [self._parse(r) for r in (data if isinstance(data, list) else [])]
-        except Exception as e:
-            logger.warning("Gitleaks scanner failed: %s", e)
-            return []
-        finally:
-            if container:
-                try:
-                    container.remove()
-                except Exception:
-                    pass
-
-    def _parse(self, r: dict) -> ScanFinding:
-        # Gitleaks reports paths as /path/<file> — strip the mount prefix
-        raw_path = r.get("File", "")
-        file_path = raw_path.removeprefix("/path/")
-        return ScanFinding(
-            scanner=ScannerType.GITLEAKS,
-            severity=Severity.CRITICAL,
-            rule_id=r.get("RuleID", "unknown"),
-            file_path=file_path,
-            line_number=r.get("StartLine"),
-            title=r.get("Description", "Secret detected"),
-            description=f"{r.get('Description', '')} in {file_path}",
-            raw={k: v for k, v in r.items() if k != "Secret"},  # never log the secret
-        )
-
 
 class ScannerOrchestrator:
     _REGISTRY: dict[ScannerType, type[BaseScanner]] = {
         ScannerType.SEMGREP: SemgrepScanner,
         ScannerType.TRIVY: TrivyScanner,
-        ScannerType.GITLEAKS: GitleaksScanner,
     }
 
     def __init__(self, enabled: list[ScannerType], build_file: str = "pom.xml", language: str | None = None):
@@ -289,11 +251,16 @@ class ScannerOrchestrator:
                 scanners.append(self._REGISTRY[s]())
         self._scanners = scanners
         self._timeout_event = threading.Event()
+        self._failure_event = threading.Event()
         self._scanner_times: dict[ScannerType, float] = {}
 
     @property
     def had_timeout(self) -> bool:
         return self._timeout_event.is_set()
+
+    @property
+    def had_failure(self) -> bool:
+        return self._failure_event.is_set()
 
     @property
     def scanner_times(self) -> dict[ScannerType, float]:
@@ -302,6 +269,7 @@ class ScannerOrchestrator:
 
     def run(self, repo_path: Path) -> list[ScanFinding]:
         self._timeout_event.clear()
+        self._failure_event.clear()
         self._scanner_times = {}
         times_lock = threading.Lock()
 
@@ -310,20 +278,27 @@ class ScannerOrchestrator:
 
         def _run_one(scanner: BaseScanner) -> list[ScanFinding]:
             t0 = _time.monotonic()
-            try:
-                results = scanner.run(repo_path)
-                elapsed = _time.monotonic() - t0
-                with times_lock:
-                    self._scanner_times[scanner.name] = elapsed
-                _step(f"{scanner.name.value}: [bold]{len(results)}[/bold] finding(s) ({elapsed:.0f}s)")
-                return results
-            except ScannerTimeoutError:
-                _step(f"[yellow]{scanner.name.value}: timed out — partial results only[/yellow]")
-                self._timeout_event.set()
-                return []
-            except Exception:
-                _step(f"[red]{scanner.name.value}: failed — skipping[/red]")
-                return []
+            for attempt in range(2):
+                try:
+                    results = scanner.run(repo_path)
+                    elapsed = _time.monotonic() - t0
+                    with times_lock:
+                        self._scanner_times[scanner.name] = elapsed
+                    _step(f"{scanner.name.value}: [bold]{len(results)}[/bold] finding(s) ({elapsed:.0f}s)")
+                    return results
+                except ScannerTimeoutError:
+                    _step(f"[yellow]{scanner.name.value}: timed out — partial results only[/yellow]")
+                    self._timeout_event.set()
+                    return []
+                except Exception:
+                    if attempt == 0:
+                        logger.warning("%s: transient failure, retrying in 10s", scanner.name.value)
+                        _time.sleep(10)
+                    else:
+                        _step(f"[red]{scanner.name.value}: failed — skipping[/red]")
+                        self._failure_event.set()
+                        return []
+            return []  # unreachable
 
         with ThreadPoolExecutor() as executor:
             result_lists = list(executor.map(_run_one, self._scanners))

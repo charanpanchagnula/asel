@@ -48,6 +48,12 @@ def test_detect_java_version_compiler_source(tmp_path):
     assert detect_java_version(tmp_path) == 17
 
 
+def test_detect_java_version_legacy_18_format(tmp_path):
+    # Java 8 was historically expressed as "1.8" in pom.xml
+    (tmp_path / "pom.xml").write_text("<project><properties><java.version>1.8</java.version></properties></project>")
+    assert detect_java_version(tmp_path) == 8
+
+
 def test_detect_java_version_missing(tmp_path):
     (tmp_path / "pom.xml").write_text("<project></project>")
     assert detect_java_version(tmp_path) is None
@@ -70,7 +76,7 @@ def test_select_maven_image_exact_match(tmp_path, java_ver, expected_tag):
     (15, "temurin-17"),   # between 11 and 17 → picks 17
     (18, "temurin-21"),   # between 17 and 21 → picks 21
     (22, "temurin-25"),   # between 21 and 25 → picks 25
-    (99, "temurin-25"),   # exceeds all available → falls back to highest
+    (99, "temurin-21"),   # exceeds all available → falls back to default (JDK 21 LTS)
 ])
 def test_select_maven_image_rounds_up(tmp_path, java_ver, expected_tag):
     (tmp_path / "pom.xml").write_text(f"<project><properties><java.version>{java_ver}</java.version></properties></project>")
