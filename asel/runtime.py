@@ -700,6 +700,7 @@ class _StartupState:
     infra_flags: list[str] = field(default_factory=list)
     dep_flags: list[str] = field(default_factory=list)
     autoconfig_excl_flags: list[str] = field(default_factory=list)
+    ds_override_flags: list[str] = field(default_factory=list)
     deps_provisioned: list[str] = field(default_factory=list)
     stubs: list[str] = field(default_factory=list)
     observed_failures: list[str] = field(default_factory=list)
@@ -1355,6 +1356,7 @@ class RuntimeEngine:
             + state.infra_flags
             + state.dep_flags
             + state.autoconfig_excl_flags
+            + state.ds_override_flags
             + (extra or [])
         )
 
@@ -1461,11 +1463,11 @@ class RuntimeEngine:
             h2_mode = self._detect_h2_mode()
             ds_flags = [f.replace("{mode}", h2_mode) if "{mode}" in f else f for f in _H2_BASE_FLAGS]
             label = "h2_override"
-        # Persist so subsequent attempts (e.g. attempt 4 JWT retry) inherit these overrides.
-        for f in ds_flags + _SECURITY_DISABLE_FLAGS:
-            if f not in state.infra_flags:
-                state.infra_flags.append(f)
-        return self._try_attempt(label, state, extra_flags=ds_flags + _SECURITY_DISABLE_FLAGS)
+        result = self._try_attempt(label, state, extra_flags=ds_flags + _SECURITY_DISABLE_FLAGS)
+        # Persist after the attempt so subsequent attempts (e.g. attempt 4 JWT retry)
+        # inherit these overrides without doubling up in attempt 3 itself.
+        state.ds_override_flags = ds_flags + _SECURITY_DISABLE_FLAGS
+        return result
 
     def _run_startup_attempts(
         self,
