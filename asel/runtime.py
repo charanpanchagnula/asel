@@ -1520,6 +1520,11 @@ class RuntimeEngine:
         if result := self._attempt_datasource_override(state):
             return result
 
+        # Attempt 4: JWT stub — attempt 3 sometimes unmasks an AUTH_BOOTSTRAP failure
+        # (e.g. eladmin's jwt.base64-secret=empty) that was hidden by earlier BeanCreation errors.
+        if result := self._attempt_config_synthesis(state):
+            return result
+
         logger.debug("All attempts failed. Startup log tail:\n%s", state.log[-2000:])
         return RuntimeResult(
             service_type=service_type,
