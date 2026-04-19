@@ -1,0 +1,654 @@
+# ASEL Dependency Registry
+#
+# Externalised from runtime.py so ops teams can update service definitions,
+# pin images to internal registries, and add new services without touching
+# Python source code.
+#
+# Sources: Testcontainers modules catalog (https://testcontainers.com/modules/)
+#          Spring Boot auto-configuration reference
+#
+# Enterprise usage:
+#   Set ASEL_IMAGE_REGISTRY=gs-docker.example.com/ to prefix all image names
+#   with an internal registry mirror. Each image value becomes:
+#     {ASEL_IMAGE_REGISTRY}{image}
+#
+# Adding a new service:
+#   1. Add an entry under `services:`
+#   2. Set build_file_patterns to Maven/Gradle artifact IDs that imply the service
+#   3. Set log_patterns to JVM stack trace fragments that indicate a missing dep
+#   4. Open a PR — no Python change needed.
+#
+# Infra overrides (non-container stubs, e.g. disable Eureka/Vault):
+#   Listed under `infra_overrides:` as (pattern, flags) pairs.
+#   Applied reactively from the startup log on attempt 2.
+
+# ---------------------------------------------------------------------------
+# Relational databases
+# ---------------------------------------------------------------------------
+
+services:
+
+  mysql:
+    # Testcontainers module: org.testcontainers:mysql
+    image: "mysql:8-debian"
+    port: 3306
+    ready_log_pattern: "ready for connections.*port: 3306|MySQL Community Server.*initialized"
+    env:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: app
+      MYSQL_USER: app
+      MYSQL_PASSWORD: asel
+    build_file_patterns:
+      - "mysql-connector"
+      - "mysql:mysql-connector"
+      - "com\\.mysql"
+      - "p6spy"                      # P6Spy SQL proxy — wraps MySQL (e.g. eladmin)
+      - "druid-spring-boot-starter"  # Alibaba Druid pool — reads JDBC URL directly
+    log_patterns:
+      - "Connection refused.*3306"
+      - "Communications link failure"
+      - "com\\.mysql\\.jdbc"
+      - "com\\.mysql\\.cj\\."
+      - "p6spy.*mysql"
+      - "Could not get JDBC Connection"
+      - "Unable to acquire JDBC Connection"
+      - "Access denied for user.*mysql"
+
+  mariadb:
+    # Testcontainers module: org.testcontainers:mariadb
+    image: "mariadb:11"
+    port: 3306
+    ready_log_pattern: "ready for connections"
+    env:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: app
+      MARIADB_USER: app
+      MARIADB_PASSWORD: asel
+    build_file_patterns:
+      - "mariadb-java-client"
+      - "org\\.mariadb"
+    log_patterns:
+      - "org\\.mariadb\\.jdbc"
+      - "Connection refused.*3306"
+
+  postgres:
+    # Testcontainers module: org.testcontainers:postgresql
+    image: "postgres:16-alpine"
+    port: 5432
+    ready_log_pattern: "database system is ready to accept connections"
+    env:
+      POSTGRES_PASSWORD: asel
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+    build_file_patterns:
+      - "postgresql"
+    log_patterns:
+      - "Connection refused.*5432"
+      - "FATAL.*database.*does not exist"
+      - "org\\.postgresql\\.util\\.PSQLException"
+      - "Unable to acquire JDBC Connection.*postgres"
+
+  mssql:
+    # Testcontainers module: org.testcontainers:mssqlserver
+    # Note: requires EULA acceptance via env var
+    image: "mcr.microsoft.com/mssql/server:2022-latest"
+    port: 1433
+    ready_log_pattern: "SQL Server is now ready for client connections"
+    env:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Asel_Pass1"
+    build_file_patterns:
+      - "mssql-jdbc"
+      - "sqljdbc"
+      - "com\\.microsoft\\.sqlserver"
+    log_patterns:
+      - "com\\.microsoft\\.sqlserver\\.jdbc"
+      - "Connection refused.*1433"
+      - "SQLServerException"
+
+  oracle:
+    # Testcontainers module: org.testcontainers:oracle-xe
+    # Free XE edition; sufficient for most app startup validation
+    image: "gvenzl/oracle-xe:21-slim"
+    port: 1521
+    ready_log_pattern: "DATABASE IS READY TO USE|Completed: ALTER DATABASE OPEN"
+    env:
+      ORACLE_PASSWORD: asel
+      APP_USER: app
+      APP_USER_PASSWORD: asel
+    build_file_patterns:
+      - "ojdbc"
+      - "oracle\\.jdbc"
+      - "com\\.oracle"
+    log_patterns:
+      - "oracle\\.jdbc"
+      - "Connection refused.*1521"
+      - "ORA-\\d+"
+
+# ---------------------------------------------------------------------------
+# Caches / key-value stores
+# ---------------------------------------------------------------------------
+
+  redis:
+    # Testcontainers module: org.testcontainers:redis (community)
+    image: "redis:7-alpine"
+    port: 6379
+    ready_log_pattern: "Ready to accept connections"
+    env: {}
+    build_file_patterns:
+      - "spring-data-redis"
+      - "jedis"
+      - "lettuce-core"
+      - "redisson"
+    log_patterns:
+      - "Connection refused.*6379"
+      - "Unable to connect to Redis"
+      - "RedisConnectionException"
+      - "redis\\.clients\\.jedis"
+      - "io\\.lettuce\\.core"
+
+  memcached:
+    image: "memcached:1.6-alpine"
+    port: 11211
+    ready_log_pattern: "server listening"
+    env: {}
+    build_file_patterns:
+      - "spymemcached"
+      - "simple-spring-memcached"
+      - "xmemcached"
+    log_patterns:
+      - "Connection refused.*11211"
+      - "net\\.spy\\.memcached"
+
+# ---------------------------------------------------------------------------
+# Document stores
+# ---------------------------------------------------------------------------
+
+  mongodb:
+    # Testcontainers module: org.testcontainers:mongodb
+    image: "mongo:7"
+    port: 27017
+    ready_log_pattern: "Waiting for connections|ready for connections"
+    env: {}
+    build_file_patterns:
+      - "mongodb-driver"
+      - "spring-data-mongodb"
+      - "flapdoodle"   # embedded mongo — real mongo is better for ASEL
+    log_patterns:
+      - "Connection refused.*27017"
+      - "com\\.mongodb\\.MongoSocketOpenException"
+      - "MongoTimeoutException"
+      - "MongoServerSelectionException"
+
+  elasticsearch:
+    # Testcontainers module: org.testcontainers:elasticsearch
+    image: "elasticsearch:8.13.0"
+    port: 9200
+    ready_log_pattern: "\"message\":\"started\"|mode.*started"
+    env:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms256m -Xmx256m"
+    build_file_patterns:
+      - "spring-data-elasticsearch"
+      - "elasticsearch-rest-client"
+      - "co\\.elastic"
+    log_patterns:
+      - "Connection refused.*9200"
+      - "NoNodeAvailableException"
+      - "org\\.elasticsearch"
+      - "co\\.elastic\\.clients"
+
+  cassandra:
+    # Testcontainers module: org.testcontainers:cassandra
+    image: "cassandra:4"
+    port: 9042
+    ready_log_pattern: "Starting listening for CQL clients|Startup complete"
+    env: {}
+    build_file_patterns:
+      - "spring-data-cassandra"
+      - "cassandra-driver"
+      - "com\\.datastax"
+    log_patterns:
+      - "Connection refused.*9042"
+      - "com\\.datastax\\.oss\\.driver"
+      - "AllNodesFailedException"
+
+  neo4j:
+    # Testcontainers module: org.testcontainers:neo4j
+    image: "neo4j:5"
+    port: 7474
+    ready_log_pattern: 'Remote interface available at|Started\.'
+    env:
+      NEO4J_AUTH: none
+    build_file_patterns:
+      - "spring-data-neo4j"
+      - "neo4j-java-driver"
+      - "org\\.neo4j"
+    log_patterns:
+      - "Connection refused.*7687"
+      - "org\\.neo4j\\.driver"
+      - "ServiceUnavailableException"
+
+# ---------------------------------------------------------------------------
+# Message brokers
+# ---------------------------------------------------------------------------
+
+  kafka:
+    # Testcontainers module: org.testcontainers:kafka
+    # Note: Kafka is also handled via _INFRA_OVERRIDES (listener.auto-startup=false)
+    # Provision the container if the app actually needs to produce/consume at startup.
+    image: "confluentinc/cp-kafka:7.6.0"
+    port: 9092
+    ready_log_pattern: "started \\(kafka\\.server\\.KafkaServer\\)|Kafka Server started"
+    env:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "asel-kafka-cluster"
+    build_file_patterns:
+      - "spring-kafka"
+      - "kafka-clients"
+      - "kafka-streams"
+    log_patterns:
+      - "Connection refused.*9092"
+      - "org\\.apache\\.kafka\\.common\\.errors"
+      - "KafkaException"
+      - "bootstrap\\.servers"
+
+  rabbitmq:
+    # Testcontainers module: org.testcontainers:rabbitmq
+    image: "rabbitmq:3.13-management-alpine"
+    port: 5672
+    ready_log_pattern: "Server startup complete|started TCP listener"
+    env:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: asel
+    build_file_patterns:
+      - "spring-rabbit"
+      - "spring-amqp"
+      - "amqp-client"
+    log_patterns:
+      - "Connection refused.*5672"
+      - "com\\.rabbitmq\\.client"
+      - "AmqpConnectException"
+      - "PossibleAuthenticationFailureException"
+
+  activemq:
+    image: "apache/activemq-artemis:latest"
+    port: 61616
+    ready_log_pattern: "AMQ241001.*HTTP Server started|Server is now live"
+    env:
+      ARTEMIS_USER: app
+      ARTEMIS_PASSWORD: asel
+    build_file_patterns:
+      - "activemq"
+      - "spring-activemq"
+      - "artemis"
+    log_patterns:
+      - "Connection refused.*61616"
+      - "ActiveMQException"
+      - "org\\.apache\\.activemq"
+
+# ---------------------------------------------------------------------------
+# AWS-compatible / cloud stubs (via LocalStack)
+# ---------------------------------------------------------------------------
+
+  localstack:
+    # Testcontainers module: org.testcontainers:localstack
+    # Covers: S3, SQS, SNS, DynamoDB, SecretsManager, and ~50 other AWS services
+    image: "localstack/localstack:3"
+    port: 4566
+    ready_log_pattern: "Ready\\."
+    env:
+      SERVICES: "s3,sqs,sns,dynamodb,secretsmanager,ssm"
+      DEFAULT_REGION: "us-east-1"
+      AWS_DEFAULT_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    build_file_patterns:
+      - "aws-java-sdk"
+      - "software\\.amazon\\.awssdk"
+      - "spring-cloud-aws"
+      - "io\\.awspring"
+    log_patterns:
+      - "Connection refused.*4566"
+      - "com\\.amazonaws\\.SdkClientException"
+      - "software\\.amazon\\.awssdk\\.core\\.exception"
+      - "NoSuchBucketException"
+
+# ---------------------------------------------------------------------------
+# Azure SDK stubs (via Azurite + official emulators)
+#
+# app_flags redirect Spring Cloud Azure to the emulator endpoints.
+# The Azurite connection string uses the well-known devstoreaccount1 identity.
+# ---------------------------------------------------------------------------
+
+  azurite:
+    # Covers: Blob (10000), Queue (10001), Table (10002)
+    # Testcontainers module: org.testcontainers:azure (AzuriteContainer)
+    image: "mcr.microsoft.com/azure-storage/azurite"
+    port: 10000
+    ready_log_pattern: "Azurite Blob service is starting|listening"
+    env: {}
+    app_flags:
+      - "--spring.cloud.azure.storage.blob.endpoint=http://localhost:10000/devstoreaccount1"
+      - "--spring.cloud.azure.storage.queue.endpoint=http://localhost:10001/devstoreaccount1"
+      - "--spring.cloud.azure.storage.table.endpoint=http://localhost:10002/devstoreaccount1"
+      - "--spring.cloud.azure.storage.blob.account-name=devstoreaccount1"
+      - "--spring.cloud.azure.storage.blob.account-key=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    build_file_patterns:
+      - "azure-storage-blob"
+      - "azure-storage-queue"
+      - "azure-storage-file-share"
+      - "spring-cloud-azure-starter-storage"
+      - "com\\.azure\\.spring"
+    log_patterns:
+      - "Connection refused.*10000"
+      - "com\\.azure\\.storage"
+      - "BlobServiceClient.*error"
+      - "StorageErrorException"
+      - "AADSTS|AzureADServiceException"
+
+  azure-cosmos:
+    # Note: the Cosmos emulator image is ~2 GB and slow to start (~90 s).
+    # Testcontainers module: org.testcontainers:azure (CosmosDBEmulatorContainer)
+    # WARNING: The emulator uses a self-signed TLS cert at https://localhost:8081/.
+    # Spring Cloud Azure will reject the connection unless the cert is trusted or
+    # TLS verification is disabled. There is no standard Spring Boot property for
+    # this — apps need to either import the emulator cert into the JVM truststore
+    # or configure `CosmosClientBuilder.gatewayMode(GatewayConnectionConfig)` with
+    # a custom SSL context. Consider this entry partially functional until TLS
+    # bypass is solved (likely requires app_env or a custom startup script).
+    # The endpoint key below is the Cosmos emulator's well-known default.
+    image: "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator"
+    port: 8081
+    ready_log_pattern: "Started|Emulator is up"
+    env:
+      AZURE_COSMOS_EMULATOR_PARTITION_COUNT: "3"
+      AZURE_COSMOS_EMULATOR_ENABLE_DATA_PERSISTENCE: "false"
+    app_flags:
+      - "--spring.cloud.azure.cosmos.endpoint=https://localhost:8081/"
+      - "--spring.cloud.azure.cosmos.key=C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw=="
+      - "--spring.cloud.azure.cosmos.consistency-level=Session"
+    build_file_patterns:
+      - "azure-cosmos"
+      - "spring-cloud-azure-starter-cosmos"
+      - "spring-data-cosmosdb"
+    log_patterns:
+      - "Connection refused.*8081"
+      - "com\\.azure\\.cosmos"
+      - "CosmosException"
+      - "DocumentClientException"
+
+  azure-servicebus:
+    # Azure Service Bus emulator (Microsoft preview, 2024)
+    # WARNING: This emulator requires a config JSON file mounted as a volume
+    # (declaring queues/topics) — pure env var setup is insufficient. The
+    # connection string below uses the emulator's well-known default key.
+    # Verify the key value against current emulator docs before production use.
+    # Also requires a SQL Server container as a backend — not yet wired here.
+    # Consider this entry experimental until fully validated.
+    image: "mcr.microsoft.com/azure-messaging/servicebus-emulator:latest"
+    port: 5672
+    ready_log_pattern: "Emulator Service is Successfully Up"
+    env:
+      ACCEPT_EULA: "Y"
+    app_flags:
+      - "--spring.cloud.azure.servicebus.connection-string=Endpoint=sb://localhost/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE_VERIFY_FROM_EMULATOR_DOCS;UseDevelopmentEmulator=true;"
+    build_file_patterns:
+      - "azure-messaging-servicebus"
+      - "spring-cloud-azure-starter-servicebus"
+      - "azure-servicebus"
+    log_patterns:
+      - "Connection refused.*5671"
+      - "Connection refused.*5672"
+      - "com\\.azure\\.messaging\\.servicebus"
+      - "ServiceBusException"
+      - "MessagingException.*servicebus"
+
+# ---------------------------------------------------------------------------
+# GCP SDK stubs
+#
+# Spring Cloud GCP properties redirect the SDK to emulator endpoints.
+# For apps using the raw GCP SDK without Spring Cloud GCP, env vars are
+# needed (PUBSUB_EMULATOR_HOST, SPANNER_EMULATOR_HOST, etc.) — these require
+# the future app_env mechanism (not yet supported). Spring Cloud GCP apps
+# work today via app_flags.
+# ---------------------------------------------------------------------------
+
+  gcp-pubsub:
+    # Testcontainers module: org.testcontainers:gcloud (PubSubEmulatorContainer)
+    # google-cloud-cli:emulators has no useful default entrypoint — command is required.
+    image: "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators"
+    port: 8085
+    ready_log_pattern: "Server started, listening on"
+    command:
+      - "gcloud"
+      - "beta"
+      - "emulators"
+      - "pubsub"
+      - "start"
+      - "--host-port=0.0.0.0:8085"
+      - "--project=asel-local"
+    env: {}
+    app_flags:
+      - "--spring.cloud.gcp.pubsub.emulator-host=localhost:8085"
+      - "--spring.cloud.gcp.pubsub.project-id=asel-local"
+    build_file_patterns:
+      - "google-cloud-pubsub"
+      - "spring-cloud-gcp-pubsub"
+      - "spring-cloud-gcp-starter-pubsub"
+    log_patterns:
+      - "Connection refused.*8085"
+      - "com\\.google\\.cloud\\.pubsub"
+      - "io\\.grpc.*pubsub"
+      - "PUBSUB_EMULATOR_HOST"
+      - "StatusRuntimeException.*UNAVAILABLE.*pubsub"
+
+  gcp-spanner:
+    # Testcontainers module: org.testcontainers:gcloud (SpannerEmulatorContainer)
+    image: "gcr.io/cloud-spanner-emulator/emulator"
+    port: 9010
+    ready_log_pattern: "Cloud Spanner emulator running|gRPC server listening"
+    env: {}
+    app_flags:
+      - "--spring.cloud.gcp.spanner.emulator.enabled=true"
+      - "--spring.cloud.gcp.spanner.emulator.port=9010"
+      - "--spring.cloud.gcp.spanner.project-id=asel-local"
+      - "--spring.cloud.gcp.spanner.instance-id=asel-instance"
+      - "--spring.cloud.gcp.spanner.database=asel-db"
+    build_file_patterns:
+      - "google-cloud-spanner"
+      - "spring-cloud-gcp-data-spanner"
+      - "spring-cloud-gcp-starter-data-spanner"
+    log_patterns:
+      - "Connection refused.*9010"
+      - "com\\.google\\.cloud\\.spanner"
+      - "io\\.grpc.*spanner"
+      - "SpannerException"
+      - "SPANNER_EMULATOR_HOST"
+
+  gcp-firestore:
+    # Testcontainers module: org.testcontainers:gcloud (FirestoreEmulatorContainer)
+    # google-cloud-cli:emulators has no useful default entrypoint — command is required.
+    # Port 8080 is the Firestore emulator default; note Keycloak also uses 8080.
+    # These two deps will not be provisioned together for the same app in practice.
+    image: "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators"
+    port: 8080
+    ready_log_pattern: "API endpoint: http"
+    command:
+      - "gcloud"
+      - "emulators"
+      - "firestore"
+      - "start"
+      - "--host-port=0.0.0.0:8080"
+    env: {}
+    app_flags:
+      - "--spring.cloud.gcp.firestore.emulator.enabled=true"
+      - "--spring.cloud.gcp.firestore.host-port=localhost:8080"
+      - "--spring.cloud.gcp.firestore.project-id=asel-local"
+    build_file_patterns:
+      - "google-cloud-firestore"
+      - "spring-cloud-gcp-data-firestore"
+      - "spring-cloud-gcp-starter-data-firestore"
+    log_patterns:
+      - "Connection refused.*8080.*firestore"
+      - "com\\.google\\.cloud\\.firestore"
+      - "FirestoreException"
+      - "FIRESTORE_EMULATOR_HOST"
+
+  gcp-bigquery:
+    # Community emulator — well-maintained, widely used
+    # https://github.com/goccy/bigquery-emulator
+    # Image has a proper entrypoint; --project is required as a command arg.
+    # NOTE: No Spring property redirect exists for BigQuery emulator. SDK redirection
+    # requires BIGQUERY_EMULATOR_HOST env var on the app process (needs app_env —
+    # not yet supported). Container is provisioned for structural reasons (readiness
+    # on the port) but the app SDK will still point at GCP unless app_env is added.
+    image: "ghcr.io/goccy/bigquery-emulator:latest"
+    port: 9050
+    ready_log_pattern: "listening"
+    command:
+      - "--project=asel-local"
+      - "--port=9050"
+    env: {}
+    app_flags: []
+    build_file_patterns:
+      - "google-cloud-bigquery"
+    log_patterns:
+      - "Connection refused.*9050"
+      - "com\\.google\\.cloud\\.bigquery"
+      - "BigQueryException"
+
+  fake-gcs:
+    # GCP Cloud Storage emulator — well-established community project
+    # https://github.com/fsouza/fake-gcs-server
+    # NOTE: Spring Cloud GCP Storage has no emulator host property. Redirect requires
+    # STORAGE_EMULATOR_HOST env var on the app process (needs app_env — not yet
+    # supported). Container is provisioned but SDK will point at real GCS until
+    # app_env is added.
+    image: "fsouza/fake-gcs-server"
+    port: 4443
+    ready_log_pattern: "server started"
+    command:
+      - "-scheme"
+      - "http"
+      - "-port"
+      - "4443"
+    env: {}
+    app_flags: []
+    build_file_patterns:
+      - "google-cloud-storage"
+      - "spring-cloud-gcp-starter-storage"
+    log_patterns:
+      - "Connection refused.*4443"
+      - "com\\.google\\.cloud\\.storage"
+      - "StorageException.*gcs"
+      - "STORAGE_EMULATOR_HOST"
+
+# ---------------------------------------------------------------------------
+# OCI (Oracle Cloud Infrastructure)
+#
+# No comprehensive LocalStack-equivalent exists for OCI.
+# Partial coverage:
+#   - OCI Object Storage: no official emulator; S3-compatible mode can be
+#     enabled on the OCI SDK but there is no Docker image to run locally.
+#   - OCI Streaming: Kafka-compatible — reuse the `kafka` entry above.
+#   - OCI Autonomous DB: use `oracle` entry above (Oracle XE).
+#   - OCI Queue, Functions, Events: no emulators available.
+#
+# For apps that use OCI SDK, the best current strategy is:
+#   1. For streaming workloads: add `kafka` dep + set Kafka endpoint flags.
+#   2. For DB workloads: add `oracle` dep.
+#   3. For storage/other: record as NOT_STARTABLE and continue probing
+#      endpoints that don't require OCI storage.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Auth / identity
+# ---------------------------------------------------------------------------
+
+  keycloak:
+    # Testcontainers module: com.github.dasniko:testcontainers-keycloak
+    image: "quay.io/keycloak/keycloak:24.0"
+    port: 8080
+    ready_log_pattern: "Keycloak.*started in|Running the server in development mode"
+    env:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: dev-mem
+    build_file_patterns:
+      - "keycloak"
+      - "spring-security-oauth2"
+      - "spring-boot-starter-oauth2-resource-server"
+    log_patterns:
+      - "Connection refused.*8080.*keycloak"
+      - "keycloak\\.auth-server-url"
+      - "Failed to obtain.*token"
+
+# ---------------------------------------------------------------------------
+# Infra overrides (non-container — JVM flag stubs applied from startup log)
+#
+# Each entry: pattern matched against startup log → flags added to next attempt.
+# These disable infrastructure that cannot or should not be containerised
+# (service registries, secret managers reachable only inside a VPN, etc.)
+# ---------------------------------------------------------------------------
+
+infra_overrides:
+
+  - pattern: "eureka|EurekaClient|DiscoveryClient"
+    flags:
+      - "--eureka.client.enabled=false"
+      - "--spring.cloud.discovery.enabled=false"
+
+  - pattern: "spring\\.cloud\\.config|ConfigServicePropertySource"
+    flags:
+      - "--spring.cloud.config.enabled=false"
+      - "--spring.config.import=optional:configserver:"
+
+  - pattern: "VaultPropertySource|VaultException|spring\\.cloud\\.vault"
+    flags:
+      - "--spring.cloud.vault.enabled=false"
+
+  - pattern: "ConsulClient|spring\\.cloud\\.consul"
+    flags:
+      - "--spring.cloud.consul.enabled=false"
+
+  - pattern: "ZookeeperClient|spring\\.cloud\\.zookeeper"
+    flags:
+      - "--spring.cloud.zookeeper.enabled=false"
+
+  - pattern: "jhipster\\.security\\.authentication\\.jwt|securityJwtConfiguration"
+    flags:
+      - "--jhipster.security.authentication.jwt.base64-secret=YWVsYXNlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGFlbGE="
+
+  - pattern: "JavaMailSender|No qualifying bean.*JavaMailSender|MailService.*mailSender"
+    flags:
+      - "--spring.mail.host=localhost"
+      - "--spring.mail.port=25"
+
+  - pattern: "Decode argument cannot be null"
+    flags:
+      - "--jwt.base64-secret=ZmQ0ZGI5NjQ0MDQwY2I4MjMxY2Y3ZmI3MjdhN2ZmMjNhODViOTg1ZGE0NTBjMGM4NDA5NzYxMjdjOWMwYWRmZTBlZjlhNGY3ZTg4Y2U3YTE1ODVkZDU5Y2Y3OGYwZWE1NzUzNWQ2YjFjZDc0NGMxZWU2MmQ3MjY1NzJmNTE0MzI="
+
+  - pattern: "LiquibaseException|liquibase\\.exception"
+    flags:
+      - "--spring.liquibase.enabled=false"
+
+  - pattern: "FlywayException|flyway\\.core"
+    flags:
+      - "--spring.flyway.enabled=false"
+
+  - pattern: "org\\.apache\\.kafka|KafkaException|bootstrap\\.servers"
+    flags:
+      - "--spring.kafka.listener.auto-startup=false"
+
+  # OAuth2 / OIDC resource server trying to fetch provider metadata from an
+  # issuer-uri or jwk-set-uri that is unreachable in ASEL's environment.
+  # Excluding the autoconfigure classes prevents Spring Security from aborting
+  # context load on a missing authorization server.
+  - pattern: "issuer-uri|jwk-set-uri|oidcProviderConfiguration|OAuth2.*authorization.server|ConnectException.*oauth|Unable to resolve.*OpenID"
+    flags:
+      - "--spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.security.oauth2.resource.servlet.OAuth2ResourceServerAutoConfiguration,org.springframework.boot.autoconfigure.security.oauth2.client.servlet.OAuth2ClientAutoConfiguration"

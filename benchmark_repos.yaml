@@ -1,0 +1,189 @@
+# ASEL benchmark repository list
+#
+# Fields: url, build_tool, name, tier
+#
+# Tier 1 — core Phase 1/2 benchmark (vulnerable web apps, expected to build + run)
+# Tier 2 — supplemental
+# Tier 3 — Vul4J corpus (real OSS projects with known CVEs, for paper benchmarking)
+
+repos:
+
+  # ── Tier 1 ────────────────────────────────────────────────────────────────
+  - url: https://github.com/OWASP-Benchmark/BenchmarkJava
+    build: maven
+    name: BenchmarkJava
+    tier: 1
+
+  - url: https://github.com/WebGoat/WebGoat
+    build: gradle
+    name: WebGoat
+    tier: 1
+
+  - url: https://github.com/SasanLabs/VulnerableApp
+    build: gradle
+    name: VulnerableApp
+    tier: 1
+
+  - url: https://github.com/OWASP/wrongsecrets
+    build: maven
+    name: wrongsecrets
+    tier: 1
+
+  - url: https://github.com/appsecco/dvja
+    build: maven
+    name: dvja
+    tier: 1
+
+  # ── Tier 2 ────────────────────────────────────────────────────────────────
+  - url: https://github.com/DataDog/vulnerable-java-application
+    build: gradle
+    name: vulnerable-java-application
+    tier: 2
+
+  # ── Tier 3 — Vul4J corpus ─────────────────────────────────────────────────
+  - url: https://github.com/apache/struts
+    build: maven
+    name: apache-struts
+    tier: 3
+
+  - url: https://github.com/apache/commons-compress
+    build: maven
+    name: commons-compress
+    tier: 3
+
+  - url: https://github.com/spring-projects/spring-framework
+    build: gradle
+    name: spring-framework
+    tier: 3
+
+  - url: https://github.com/spring-projects/spring-security
+    build: gradle
+    name: spring-security
+    tier: 3
+
+  - url: https://github.com/apache/camel
+    build: maven
+    name: apache-camel
+    tier: 3
+
+  - url: https://github.com/FasterXML/jackson-dataformat-xml
+    build: maven
+    name: jackson-dataformat-xml
+    tier: 3
+
+  - url: https://github.com/apache/commons-fileupload
+    build: maven
+    name: commons-fileupload
+    tier: 3
+
+  - url: https://github.com/jhy/jsoup
+    build: maven
+    name: jsoup
+    tier: 3
+
+  - url: https://github.com/alibaba/fastjson
+    build: maven
+    name: fastjson
+    tier: 3
+
+  - url: https://github.com/apache/shiro
+    build: maven
+    name: apache-shiro
+    tier: 3
+
+  - url: https://github.com/x-stream/xstream
+    build: maven
+    name: xstream
+    tier: 3
+
+  - url: https://github.com/ESAPI/esapi-java-legacy
+    build: maven
+    name: esapi-java-legacy
+    tier: 3
+
+  # ── Phase 2 runtime / WAR testing ─────────────────────────────────────────
+  - url: https://github.com/spring-projects/spring-petclinic
+    build: maven
+    name: spring-petclinic
+    tier: 2
+
+  - url: https://github.com/jhipster/jhipster-sample-app
+    build: maven
+    name: jhipster-sample-app
+    tier: 2
+
+  - url: https://github.com/OWASP/SecurityShepherd
+    build: maven
+    name: SecurityShepherd
+    tier: 2
+
+  - url: https://github.com/WebGoat/WebGoat-Legacy
+    build: maven
+    name: WebGoat-Legacy
+    tier: 2
+
+  - url: https://github.com/elunez/eladmin
+    build: maven
+    name: eladmin
+    tier: 2
+
+  - url: https://github.com/baeldung/spring-security-registration
+    build: maven
+    name: spring-security-registration
+    tier: 2
+
+  - url: https://github.com/thombergs/buckpal
+    build: maven
+    name: buckpal
+    tier: 2
+
+  - url: https://github.com/macrozheng/mall-tiny
+    build: maven
+    name: mall-tiny
+    tier: 2
+
+  # ── New repos targeting OAuth2/JWT/lazy-init failure classes ──────────────
+  - url: https://github.com/macrozheng/mall
+    build: maven
+    name: mall
+    tier: 2
+
+  - url: https://github.com/halo-dev/halo
+    build: gradle
+    name: halo
+    tier: 2
+
+  - url: https://github.com/YunaiV/ruoyi-vue-pro
+    build: maven
+    name: ruoyi-vue-pro
+    tier: 2
+
+  # ── Broad dependency coverage ─────────────────────────────────────────────
+  - url: https://github.com/sqshq/piggymetrics
+    build: maven
+    name: piggymetrics
+    tier: 2
+
+  - url: https://github.com/macrozheng/mall-swarm
+    build: maven
+    name: mall-swarm
+    tier: 2
+
+  - url: https://github.com/dromara/hertzbeat
+    build: maven
+    name: hertzbeat
+    tier: 2
+
+  - url: https://github.com/openzipkin/zipkin
+    build: maven
+    name: zipkin
+    tier: 2
+
+  - url: https://github.com/YunaiV/yudao-cloud
+    build: maven
+    name: yudao-cloud
+    tier: 2
+
+  # stratospheric: monorepo — Spring Boot app is in application/ subdir.
+  # Needs ingestor subdir support before it can run.
+  # - url: https://github.com/stratospheric-dev/stratospheric

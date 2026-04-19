@@ -10,7 +10,7 @@ Core loop: Clone → Build → Scan → Agent proposes fix → Apply fix → Reb
 
 ## Phase 1 Scope (POC)
 
-- **Target only Java/Maven projects** — no Node, Python, Go yet
+- **Target Java projects (Maven and Gradle)** — no Node, Python, Go yet
 - **Local execution only** — no cloud runners, no Kubernetes
 - **Open-source scanners only** — Semgrep (SAST), Trivy (SCA), Gitleaks (secrets)
 - **No UI, no RBAC, no vendor API integrations**
@@ -28,7 +28,7 @@ Seven components (in pipeline order):
 
 1. **Repository Ingestor** — git clone + language/runtime detection
 2. **Ephemeral Execution Environment** — Docker container, resource-limited, controlled egress
-3. **Build Engine** — Maven execution, captures structured logs and errors
+3. **Build Engine** — Maven and Gradle execution, captures structured logs and errors
 4. **Runtime Engine** — app startup attempt, crash loop detection, stacktrace capture
 5. **Scanner Orchestrator** — runs Semgrep, Trivy, Gitleaks in sequence (DAST deferred to Phase 2)
 6. **Agentic Remediation Engine** — analyzes findings, applies minimal patches, fixes build/runtime errors
@@ -41,6 +41,7 @@ Seven components (in pipeline order):
 - Accept partial success — a 30–40% build success rate is a valid POC outcome
 - Avoid enterprise complexity early (no compliance features, no distributed services)
 - Minimal patches only — the remediation engine should make the smallest viable change
+- Deterministic-first error handling — parse and classify build errors categorically using heuristics (`categorize_*` functions); only escalate to the LLM for failure classes that cannot be classified. The agent is a component of last resort, not the primary reasoning path for known error patterns
 
 ## Python Stack
 
