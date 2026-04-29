@@ -19,6 +19,7 @@ import shlex
 import socket
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -242,9 +243,17 @@ _FAILURE_PATTERNS: list[tuple[str, RuntimeFailureClass]] = [
     (r"org\.apache\.kafka.*Exception|KafkaException|bootstrap\.servers.*failed|"
      r"AmqpConnectException|RabbitMQ.*connection|ActiveMQ.*connect",
      RuntimeFailureClass.MESSAGING),
+    # Missing static classpath resource at startup (e.g. Zipkin Lens UI, bundled SPA assets)
+    # Must appear before RESOURCE_NOT_FOUND so the specific pattern wins.
+    (r"Could not load.*class path resource|classpath resource.*not found|"
+     r"ZipkinUiConfiguration|zipkin-lens",
+     RuntimeFailureClass.MISSING_STATIC),
     # Classpath resource inaccessible (WAR/nested JAR)
     (r"ResourceUtils\.getFile|Cannot search.*URL.*war:|FileNotFoundException.*classpath:",
      RuntimeFailureClass.RESOURCE_NOT_FOUND),
+    # JAR has no Main-Class manifest attribute (thin/non-repackaged JAR was selected)
+    (r"no main manifest attribute",
+     RuntimeFailureClass.NO_MAIN_MANIFEST),
     # External HTTP timeout (proxy should catch most; this fires when proxy isn't running yet)
     (r"ConnectTimeoutException|SocketTimeoutException|Connection timed out.*:443|"
      r"UnknownHostException",
@@ -399,6 +408,8 @@ RECOVERY_PLAN: dict[RuntimeFailureClass, list[str]] = {
     RuntimeFailureClass.TOMCAT_LISTENER:    ["read_tomcat_context_log"],
     RuntimeFailureClass.BEAN_CREATION:      ["reclassify_from_cause"],
     RuntimeFailureClass.MISSING_CLASS:      ["exclude_missing_class_autoconfig"],
+    RuntimeFailureClass.MISSING_STATIC:    ["disable_static_resource_bean"],
+    RuntimeFailureClass.NO_MAIN_MANIFEST:  [],  # non-recoverable at runtime; signal to skip
     RuntimeFailureClass.UNKNOWN:            ["llm_startup_repair"],
 }
 
@@ -457,6 +468,40 @@ _ADD_OPENS_FLAGS = [
 
 # ── Config synthesizer ────────────────────────────────────────────────────────
 
+def _flatten_yaml(data: object, prefix: str = "") -> dict[str, str]:
+    """Recursively flatten a nested YAML dict to Spring-style dot-notation keys."""
+    result: dict[str, str] = {}
+    if not isinstance(data, dict):
+        return result
+    for k, v in data.items():
+        full_key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            result.update(_flatten_yaml(v, full_key))
+        elif v is not None and not isinstance(v, list):
+            s = str(v).strip()
+            if s and not s.startswith("${"):
+                result[full_key] = s
+    return result
+
+
+def _scan_profile_configs(repo_path: Path) -> dict[str, str]:
+    """
+    Read all application-*.yml/yaml files and return a flat dict of their defined
+    properties. Used to recover values that live only in a non-active profile
+    (e.g. jwt.header in application-dev.yml while the app runs with test/local).
+    Later profiles win over earlier ones when keys conflict.
+    """
+    collected: dict[str, str] = {}
+    for pattern in ("**/application-*.yml", "**/application-*.yaml"):
+        for cfg in sorted(repo_path.glob(pattern)):
+            try:
+                doc = yaml.safe_load(cfg.read_text(errors="replace")) or {}
+                collected.update(_flatten_yaml(doc))
+            except Exception:
+                pass
+    return collected
+
+
 def synthesize_config(startup_log: str, repo_path: Path) -> dict[str, str]:
     """
     Heuristically synthesize Spring Boot property values for unresolved
@@ -466,6 +511,8 @@ def synthesize_config(startup_log: str, repo_path: Path) -> dict[str, str]:
     Extraction sources (in order):
     1. Startup log "Could not resolve placeholder 'X'" messages
     2. ${X} / ${X:default} patterns in *.properties and *.yml config files
+    3. Literal values from profile-specific application-*.yml files (for keys
+       that live only in a non-active profile, e.g. jwt.* in application-dev.yml)
 
     Synthesis rules (deterministic, no LLM needed for most keys):
     - secret / key / password / token          → 64-char hex string
@@ -491,15 +538,24 @@ def synthesize_config(startup_log: str, repo_path: Path) -> dict[str, str]:
         for cfg in repo_path.glob(glob_pat):
             try:
                 text = cfg.read_text(errors="replace")
-                # Match ${KEY} and ${KEY:} (empty default = effectively unset)
-                # but NOT ${KEY:somevalue} (non-empty default resolves fine)
-                for m in re.finditer(r"\$\{([^}:]+):?\}", text):
+                # Only match ${KEY} with no default at all.
+                # ${KEY:} has an empty default the developer chose — honour it (empty).
+                # ${KEY:value} has a non-empty default — also resolves fine.
+                # Both forms are skipped here; only truly required placeholders need stubs.
+                for m in re.finditer(r"\$\{([^}:]+)\}", text):
                     keys.add(m.group(1).strip())
             except Exception:
                 pass
 
     if not keys:
         return {}
+
+    # Source 3: literal values from profile-specific configs.
+    # When a property is defined only in a non-active profile (e.g. application-dev.yml
+    # while running with --spring.profiles.active=test,local), Spring cannot resolve it.
+    # We pick the value up from the profile file so the app gets the developer's intended
+    # value rather than a meaningless "placeholder-X" stub.
+    profile_values = _scan_profile_configs(repo_path)
 
     result: dict[str, str] = {}
     for key in keys:
@@ -509,6 +565,10 @@ def synthesize_config(startup_log: str, repo_path: Path) -> dict[str, str]:
             continue
         # Skip server.port — injected separately
         if lower in ("server.port",):
+            continue
+        # Use literal value from a non-active profile config when available
+        if key in profile_values:
+            result[key] = profile_values[key]
             continue
         # Secret / token / password / key → random hex
         if any(w in lower for w in ("secret", "password", "passwd", "token", "apikey", "api-key")):
@@ -533,6 +593,24 @@ def synthesize_config(startup_log: str, repo_path: Path) -> dict[str, str]:
             stem = key.split(".")[-1].replace("-", "_")
             result[key] = f"placeholder-{stem}"
 
+    # Expand profile-config families to avoid sequential "one placeholder at a time"
+    # failures. When jwt.header is needed and lives in application-dev.yml, we should
+    # also inject jwt.token-start-with, jwt.online-key, etc. from the same file.
+    # Only expand short top-level namespaces (jwt, app, security, ...) to avoid
+    # over-injecting from broad namespaces like spring.* or management.*.
+    _BROAD_NAMESPACES = frozenset(("spring", "server", "management", "logging", "info", "debug"))
+    family_prefixes: set[str] = set()
+    for k in list(result.keys()):
+        if k in profile_values:
+            top = k.split(".")[0]
+            if top not in _BROAD_NAMESPACES:
+                family_prefixes.add(top)
+    for prefix in family_prefixes:
+        for pkey, pval in profile_values.items():
+            if pkey.startswith(prefix + ".") and pkey not in result:
+                result[pkey] = pval
+                logger.debug("Config synthesis: expanding family %s.* → %s", prefix, pkey)
+
     logger.info("Config synthesis: produced %d property stubs for SPRING_APPLICATION_JSON", len(result))
     return result
 
@@ -544,15 +622,25 @@ def synthesize_config(startup_log: str, repo_path: Path) -> dict[str, str]:
 # MySQL container we already provisioned in attempt 2, with credentials that match our
 # provisioned MySQL (root/root). Both the generic spring.datasource.* and Druid-specific
 # spring.datasource.druid.* namespaces are set so Druid picks them up.
+_MYSQL_JDBC = (
+    "jdbc:mysql://localhost:3306/app?"
+    "createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+)
+
 _DRUID_MYSQL_REDIRECT_FLAGS = [
-    "--spring.datasource.url=jdbc:mysql://localhost:3306/app?"
-    "createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC",
+    f"--spring.datasource.url={_MYSQL_JDBC}",
     "--spring.datasource.username=root",
     "--spring.datasource.password=root",
-    "--spring.datasource.druid.url=jdbc:mysql://localhost:3306/app?"
-    "createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC",
+    f"--spring.datasource.druid.url={_MYSQL_JDBC}",
     "--spring.datasource.druid.username=root",
     "--spring.datasource.druid.password=root",
+    # dynamic-datasource-spring-boot-starter (baomidou): named datasource groups
+    f"--spring.datasource.dynamic.datasource.master.url={_MYSQL_JDBC}",
+    "--spring.datasource.dynamic.datasource.master.username=root",
+    "--spring.datasource.dynamic.datasource.master.password=root",
+    f"--spring.datasource.dynamic.datasource.slave.url={_MYSQL_JDBC}",
+    "--spring.datasource.dynamic.datasource.slave.username=root",
+    "--spring.datasource.dynamic.datasource.slave.password=root",
     "--spring.jpa.hibernate.ddl-auto=create-drop",
     "--spring.liquibase.enabled=false",
     "--spring.flyway.enabled=false",
@@ -629,6 +717,11 @@ _WAR_JVM_ENV: dict[str, str] = {
 # When any of these appears, there is no point continuing to poll — the app
 # will not recover on its own. We bail early so _start_war can read the log
 # and provision missing deps for attempt 2.
+_WAR_TOMCAT_STARTED_RE = re.compile(
+    r"Server startup in \[?\d+\]? millisecond",
+    re.IGNORECASE,
+)
+
 _FATAL_WAR_PATTERNS: list[str] = [
     r"SEVERE.*Exception sending context initialized",  # Tomcat: Spring ContextLoaderListener failed
     r"SEVERE.*listeners failed to start",              # Tomcat 9+: generic listener failure
@@ -679,6 +772,39 @@ HTTPServer(('127.0.0.1',18080),_P).serve_forever()
 """
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _jar_has_main_class(path: Path) -> bool:
+    """Return True if the JAR manifest declares a Main-Class attribute."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if "META-INF/MANIFEST.MF" not in zf.namelist():
+                return False
+            manifest = zf.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+            return "Main-Class:" in manifest
+    except Exception:
+        return False
+
+
+def _jar_is_confirmed_thin(path: Path) -> bool:
+    """
+    Return True only when we can *confirm* the JAR is a thin (non-executable) JAR —
+    i.e., it is a valid ZIP file and its MANIFEST.MF explicitly lacks a Main-Class.
+
+    Returns False (= "not confirmed thin") when the file is unreadable, not a valid
+    ZIP, or when the MANIFEST is absent (we cannot confirm either way).  Callers
+    should treat an unreadable file as a potential executable rather than skipping it.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if "META-INF/MANIFEST.MF" not in zf.namelist():
+                # No manifest at all — cannot confirm; treat as potentially executable
+                return False
+            manifest = zf.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+            return "Main-Class:" not in manifest
+    except Exception:
+        # Corrupt/non-ZIP file — cannot confirm thin; don't discard it
+        return False
+
 
 def _free_port() -> int:
     """Return an available TCP port on the host."""
@@ -906,7 +1032,28 @@ class RuntimeEngine:
             ]
 
         if candidates:
-            return max(candidates, key=lambda p: p.stat().st_size)
+            executable = [p for p in candidates if _jar_has_main_class(p)]
+            if executable:
+                return max(executable, key=lambda p: p.stat().st_size)
+            # No JAR with a confirmed Main-Class found.
+            # Filter out JARs that are *confirmed* thin (valid ZIP, manifest present,
+            # no Main-Class). Keep JARs that are unreadable/non-ZIP — they may be
+            # incomplete builds that still contain embedded content.
+            not_confirmed_thin = [p for p in candidates if not _jar_is_confirmed_thin(p)]
+            if not_confirmed_thin:
+                # Fall back to the largest unconfirmed JAR (test stubs and partially
+                # written fat JARs land here).
+                return max(not_confirmed_thin, key=lambda p: p.stat().st_size)
+            # Every candidate is a confirmed thin JAR — running any of them will
+            # produce "no main manifest attribute". Return None so the caller emits
+            # a clear "No runnable JAR found" diagnostic.
+            logger.warning(
+                "_find_jar: %d candidate JAR(s) found but all are confirmed thin JARs "
+                "(no Main-Class in MANIFEST.MF) — the build likely did not run "
+                "spring-boot:repackage. Treating as no runnable JAR.",
+                len(candidates),
+            )
+            return None
 
         # Spring Boot WAR: <packaging>war</packaging> + spring-boot-starters.
         # The repackaged WAR is executable via 'java -jar app.war' (contains
@@ -957,14 +1104,16 @@ class RuntimeEngine:
         return 8080
 
     def _detect_druid(self) -> bool:
-        """Return True if the build file uses Alibaba Druid connection pool.
+        """Return True if the build file uses Alibaba Druid or dynamic-datasource.
 
-        Druid ignores Spring Boot's H2 datasource override because it reads
-        spring.datasource.url and instantiates the driver class directly, so it
-        tries to load org.h2.Driver which is often not on the classpath.  When
-        Druid is detected we substitute a MySQL redirect for attempt 3 instead.
+        Both Druid and dynamic-datasource-spring-boot-starter bypass Spring Boot's
+        H2 override because they read spring.datasource.url and instantiate drivers
+        directly, so H2 override fails. MySQL redirect is substituted for attempt 3.
+        dynamic-datasource also needs its own spring.datasource.dynamic.* properties
+        added to _DRUID_MYSQL_REDIRECT_FLAGS.
         """
-        return "druid-spring-boot-starter" in self._read_build_file()
+        build = self._read_build_file()
+        return "druid-spring-boot-starter" in build or "dynamic-datasource-spring-boot-starter" in build
 
     def _detect_h2_mode(self) -> str:
         """Pick H2 compatibility mode based on build file dependencies."""
@@ -1151,6 +1300,14 @@ class RuntimeEngine:
         # ROOT.war is Tomcat/Jetty's convention for the root context — no prefix.
         context_path = "" if war.stem.upper() == "ROOT" else f"/{war.stem}"
 
+        # Pre-flight: provision deps declared in the build file before first attempt.
+        # Matches the JAR startup path. Catches cases like WebGoat-Legacy where the
+        # WAR context listener fails silently because the DB is missing.
+        build_deps = self._provision_deps_from_build()
+        if build_deps:
+            logger.info("WAR pre-flight: provisioned from build file: %s", build_deps)
+            time.sleep(DEP_SETTLE_SECONDS)
+
         # ── Attempt 1: plain deployment ───────────────────────────────────────
         host_port = _free_port()
         self._host_port = host_port
@@ -1239,6 +1396,17 @@ class RuntimeEngine:
                 time.sleep(POLL_INTERVAL_SECONDS)
 
         log = self._read_war_log()
+        # If Tomcat started successfully but every probe hit 5xx (e.g. a DB-gated
+        # filter like BenchmarkJava's DataBaseFilter), count the app as STARTED —
+        # the server is up even if individual endpoints require a connected database.
+        if re.search(_WAR_TOMCAT_STARTED_RE, log) and not any(
+            re.search(p, log, re.IGNORECASE) for p in _FATAL_WAR_PATTERNS
+        ):
+            logger.info("WAR: Tomcat started but all probes returned 5xx — marking as STARTED")
+            return self._make_result(
+                service_type, host_port, context_path or "/", timeout,
+                [], [], f"war_deploy ({container_image})", base_url,
+            )
         return RuntimeResult(
             service_type=service_type,
             status=RuntimeStatus.FAILED_TO_START,
@@ -1434,14 +1602,20 @@ class RuntimeEngine:
             r"Decode argument cannot be null|jwt.*base64.*null|base64.*secret.*null",
             state.log, re.IGNORECASE,
         ):
+            # "Decode argument cannot be null" means jwt.base64-secret is null at runtime.
+            # synthesize_config() misses this because the log never says
+            # "Could not resolve placeholder 'jwt.base64-secret'" — the secret is just null.
+            # Fix: inject a fresh random secret plus all non-broad profile properties so the
+            # app gets its intended jwt.*, swagger.*, login.* etc. from the dev profile.
             import secrets as _sec, base64 as _b64
-            jwt_stub = {
-                "jwt.base64-secret": _b64.b64encode(_sec.token_hex(32).encode()).decode(),
-                "jwt.token-validity-in-seconds": "86400",
-                "jwt.token-validity-in-seconds-for-remember-me": "604800",
-            }
-            synthesized = {**jwt_stub, **(synthesized or {})}
-            logger.info("inject_jwt_stub: merging JWT stub values for null-secret failure")
+            _BROAD_NS = frozenset(("spring", "server", "management", "logging", "info", "debug"))
+            profile_all = _scan_profile_configs(self._repo_path)
+            extra_profile = {k: v for k, v in profile_all.items()
+                             if k.split(".")[0] not in _BROAD_NS}
+            # Override any hardcoded dev secret with a fresh random one.
+            extra_profile["jwt.base64-secret"] = _b64.b64encode(_sec.token_hex(32).encode()).decode()
+            synthesized = {**extra_profile, **(synthesized or {})}
+            logger.info("inject_jwt_stub: injecting profile properties + fresh jwt secret")
         if not synthesized:
             logger.debug("Config synthesis: no unresolved placeholders found — skipping attempt 2b")
             return None
@@ -1525,6 +1699,10 @@ class RuntimeEngine:
         # Attempt 3: datasource override + security disable
         if result := self._attempt_datasource_override(state):
             return result
+
+        # Absorb any new infra failures exposed by attempt 3 (e.g. Redis auth error that
+        # only surfaces once the datasource is resolved) before attempt 4.
+        self._refresh_infra_and_deps(state)
 
         # Attempt 4: JWT stub — attempt 3 sometimes unmasks an AUTH_BOOTSTRAP failure
         # (e.g. eladmin's jwt.base64-secret=empty) that was hidden by earlier BeanCreation errors.

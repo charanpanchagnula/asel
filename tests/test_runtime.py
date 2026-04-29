@@ -734,3 +734,84 @@ class TestReclassifyFromCause:
         log = "BeanCreationException: Error creating bean with name 'foo'"
         result = reclassify_from_cause(log)
         assert result is not RuntimeFailureClass.BEAN_CREATION
+
+
+class TestJwtStubCleanup:
+    """jwt_stub block should only inject jwt.base64-secret, not hardcoded validity keys."""
+
+    def _make_engine(self, tmp_path):
+        with patch("asel.runtime.docker.from_env", return_value=MagicMock()):
+            return RuntimeEngine(tmp_path, Language.JAVA_MAVEN, "maven:3.9-eclipse-temurin-21")
+
+    def test_jwt_stub_does_not_inject_hardcoded_validity(self, tmp_path):
+        """Hardcoded validity defaults must not appear when not in any profile config."""
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        engine = self._make_engine(tmp_path)
+
+        from asel.runtime import _StartupState
+        from asel.models import ServiceType
+        import json
+
+        state = _StartupState(
+            service_type=ServiceType.SPRING_BOOT,
+            jar=tmp_path / "app.jar",
+            host_port=8080,
+            timeout=30,
+            port_flag="--server.port=8080",
+        )
+        state.failure_class = RuntimeFailureClass.AUTH_BOOTSTRAP
+        state.log = "Decode argument cannot be null"
+
+        captured_env = {}
+
+        def fake_try_attempt(label, st, extra_flags=None, extra_env=None):
+            if extra_env:
+                captured_env.update(extra_env)
+            return None
+
+        with patch.object(engine, "_try_attempt", side_effect=fake_try_attempt):
+            engine._attempt_config_synthesis(state)
+
+        assert "SPRING_APPLICATION_JSON" in captured_env
+        props = json.loads(captured_env["SPRING_APPLICATION_JSON"])
+        assert "jwt.base64-secret" in props
+        assert "jwt.token-validity-in-seconds" not in props
+        assert "jwt.token-validity-in-seconds-for-remember-me" not in props
+
+    def test_jwt_stub_injects_validity_when_present_in_profile_config(self, tmp_path):
+        """If profile config has validity, it must be injected (via extra_profile, not hardcoded)."""
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        resources = tmp_path / "src" / "main" / "resources"
+        resources.mkdir(parents=True)
+        (resources / "application-dev.yml").write_text(
+            "jwt:\n  base64-secret: devSecret\n  token-validity-in-seconds: 3600\n"
+        )
+        engine = self._make_engine(tmp_path)
+
+        from asel.runtime import _StartupState
+        from asel.models import ServiceType
+        import json
+
+        state = _StartupState(
+            service_type=ServiceType.SPRING_BOOT,
+            jar=tmp_path / "app.jar",
+            host_port=8080,
+            timeout=30,
+            port_flag="--server.port=8080",
+        )
+        state.failure_class = RuntimeFailureClass.AUTH_BOOTSTRAP
+        state.log = "Decode argument cannot be null"
+
+        captured_env = {}
+
+        def fake_try_attempt(label, st, extra_flags=None, extra_env=None):
+            if extra_env:
+                captured_env.update(extra_env)
+            return None
+
+        with patch.object(engine, "_try_attempt", side_effect=fake_try_attempt):
+            engine._attempt_config_synthesis(state)
+
+        props = json.loads(captured_env["SPRING_APPLICATION_JSON"])
+        assert props.get("jwt.token-validity-in-seconds") == "3600"
+        assert props.get("jwt.base64-secret") != "devSecret"
