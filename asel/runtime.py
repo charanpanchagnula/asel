@@ -502,6 +502,41 @@ def _scan_profile_configs(repo_path: Path) -> dict[str, str]:
     return collected
 
 
+def _llm_repair_call(log_tail: str, model_id: str, provider: str) -> str:
+    """
+    Ask the LLM to diagnose an UNKNOWN startup failure and propose a minimal fix.
+    Returns the raw LLM response text. Raises on any LLM/network error.
+    Extracted as a module-level function so tests can patch it without touching agno internals.
+    """
+    from agno.agent import Agent
+
+    def _make_llm(mid: str, prov: str):
+        if prov == "deepseek":
+            from agno.models.deepseek import DeepSeek
+            return DeepSeek(id=mid)
+        if prov == "openai":
+            from agno.models.openai import OpenAIChat
+            return OpenAIChat(id=mid)
+        if prov == "anthropic":
+            from agno.models.anthropic import Claude
+            return Claude(id=mid)
+        raise ValueError(f"Unknown LLM provider: {prov}")
+
+    prompt = (
+        "A Java Spring Boot application failed to start with the following log:\n\n"
+        f"<log>\n{log_tail}\n</log>\n\n"
+        "Diagnose the startup failure and suggest a minimal fix.\n"
+        "Return ONLY a JSON object — no explanation outside the JSON — with these keys:\n"
+        '  "properties": dict of Spring Boot properties to inject via SPRING_APPLICATION_JSON\n'
+        '  "flags": list of JVM/Spring Boot CLI flags (e.g. "--spring.autoconfigure.exclude=...")\n'
+        '  "reason": one-line explanation\n\n'
+        'Example: {"properties": {"some.prop": "val"}, "flags": [], "reason": "app needs some.prop"}'
+    )
+    agent = Agent(model=_make_llm(model_id, provider))
+    response = agent.run(prompt)
+    return response.content if hasattr(response, "content") else str(response)
+
+
 def synthesize_config(startup_log: str, repo_path: Path) -> dict[str, str]:
     """
     Heuristically synthesize Spring Boot property values for unresolved
@@ -855,10 +890,13 @@ class RuntimeEngine:
     Call stop() in a finally block to clean up all Docker resources.
     """
 
-    def __init__(self, repo_path: Path, language: Language, build_image: str):
+    def __init__(self, repo_path: Path, language: Language, build_image: str,
+                 llm_model: str = "", llm_provider: str = ""):
         self._repo_path = repo_path.resolve()
         self._language = language
         self._build_image = build_image
+        self._llm_model = llm_model
+        self._llm_provider = llm_provider
         self._client = docker.from_env()
         self._runtime_container = None
         self._dep_containers: list = []
@@ -1643,6 +1681,50 @@ class RuntimeEngine:
         state.ds_override_flags = ds_flags + _SECURITY_DISABLE_FLAGS
         return result
 
+    def _attempt_llm_repair(self, state: _StartupState) -> "RuntimeResult | None":
+        """
+        Last-resort attempt for UNKNOWN failure class: ask the LLM to diagnose
+        the startup log and propose a minimal fix as SPRING_APPLICATION_JSON
+        properties + JVM flags. Fires at most once per run. No-ops when no LLM
+        is configured (llm_model is empty).
+        """
+        if state.failure_class is not RuntimeFailureClass.UNKNOWN:
+            return None
+        if not self._llm_model:
+            logger.debug("LLM startup repair skipped — no LLM model configured")
+            return None
+
+        log_tail = state.log[-2000:]
+        logger.info("UNKNOWN failure — attempting LLM-assisted startup repair")
+        try:
+            raw = _llm_repair_call(log_tail, self._llm_model, self._llm_provider)
+        except Exception as exc:
+            logger.warning("LLM startup repair call failed: %s", exc)
+            return None
+
+        import json as _json
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            logger.warning("LLM startup repair: response contained no JSON")
+            return None
+        try:
+            fix = _json.loads(m.group())
+        except _json.JSONDecodeError as exc:
+            logger.warning("LLM startup repair: invalid JSON — %s", exc)
+            return None
+
+        props = fix.get("properties") or {}
+        flags = fix.get("flags") or []
+        reason = fix.get("reason", "")
+        if not props and not flags:
+            logger.info("LLM startup repair: suggested no changes (%s)", reason)
+            return None
+
+        logger.info("LLM startup repair applying fix: %s  flags=%s  props=%s", reason, flags, list(props))
+        state.stubs.append("llm_repair")
+        extra_env = {"SPRING_APPLICATION_JSON": _json.dumps(props)} if props else None
+        return self._try_attempt("llm_repair", state, extra_flags=flags or None, extra_env=extra_env)
+
     def _run_startup_attempts(
         self,
         service_type: ServiceType,
@@ -1707,6 +1789,12 @@ class RuntimeEngine:
         # Attempt 4: JWT stub — attempt 3 sometimes unmasks an AUTH_BOOTSTRAP failure
         # (e.g. eladmin's jwt.base64-secret=empty) that was hidden by earlier BeanCreation errors.
         if result := self._attempt_config_synthesis(state):
+            return result
+
+        # Attempt 5: LLM-assisted repair — only fires for UNKNOWN failure class when an
+        # LLM model is configured. Sends the startup log to the LLM and applies the
+        # suggested SPRING_APPLICATION_JSON properties + JVM flags. Last resort.
+        if result := self._attempt_llm_repair(state):
             return result
 
         logger.debug("All attempts failed. Startup log tail:\n%s", state.log[-2000:])

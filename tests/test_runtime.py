@@ -815,3 +815,108 @@ class TestJwtStubCleanup:
         props = json.loads(captured_env["SPRING_APPLICATION_JSON"])
         assert props.get("jwt.token-validity-in-seconds") == "3600"
         assert props.get("jwt.base64-secret") != "devSecret"
+
+
+class TestLlmStartupRepair:
+    """_attempt_llm_repair fires on UNKNOWN, calls LLM, applies result."""
+
+    def _make_engine(self, tmp_path, model="deepseek-chat", provider="deepseek"):
+        with patch("asel.runtime.docker.from_env", return_value=MagicMock()):
+            return RuntimeEngine(tmp_path, Language.JAVA_MAVEN, "maven:3.9-eclipse-temurin-21",
+                                 llm_model=model, llm_provider=provider)
+
+    def test_skips_when_no_llm_model(self, tmp_path):
+        """Engine with no LLM model configured must not call LLM."""
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        engine = self._make_engine(tmp_path, model="", provider="")
+
+        from asel.runtime import _StartupState
+        from asel.models import ServiceType
+        state = _StartupState(
+            service_type=ServiceType.SPRING_BOOT,
+            jar=tmp_path / "app.jar",
+            host_port=8080, timeout=30, port_flag="--server.port=8080",
+        )
+        state.failure_class = RuntimeFailureClass.UNKNOWN
+        state.log = "Some weird error we have never seen"
+
+        result = engine._attempt_llm_repair(state)
+        assert result is None
+
+    def test_skips_when_failure_class_not_unknown(self, tmp_path):
+        """Must not call LLM when failure class is known (classifiable)."""
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        engine = self._make_engine(tmp_path)
+
+        from asel.runtime import _StartupState
+        from asel.models import ServiceType
+        state = _StartupState(
+            service_type=ServiceType.SPRING_BOOT,
+            jar=tmp_path / "app.jar",
+            host_port=8080, timeout=30, port_flag="--server.port=8080",
+        )
+        state.failure_class = RuntimeFailureClass.AUTH_BOOTSTRAP
+        state.log = "jwt secret null"
+
+        result = engine._attempt_llm_repair(state)
+        assert result is None
+
+    def test_applies_llm_suggested_properties(self, tmp_path):
+        """When LLM returns properties dict, they must be passed as SPRING_APPLICATION_JSON."""
+        import json
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        engine = self._make_engine(tmp_path)
+
+        from asel.runtime import _StartupState
+        from asel.models import ServiceType
+        state = _StartupState(
+            service_type=ServiceType.SPRING_BOOT,
+            jar=tmp_path / "app.jar",
+            host_port=8080, timeout=30, port_flag="--server.port=8080",
+        )
+        state.failure_class = RuntimeFailureClass.UNKNOWN
+        state.log = "Caused by: some weird error"
+
+        llm_response = json.dumps({
+            "properties": {"some.custom.property": "fixedValue"},
+            "flags": ["--some.flag=true"],
+            "reason": "app needs some.custom.property"
+        })
+
+        captured = {}
+
+        def fake_try_attempt(label, st, extra_flags=None, extra_env=None):
+            captured["label"] = label
+            captured["flags"] = extra_flags or []
+            captured["env"] = extra_env or {}
+            return None
+
+        with patch.object(engine, "_try_attempt", side_effect=fake_try_attempt), \
+             patch("asel.runtime._llm_repair_call", return_value=llm_response):
+            engine._attempt_llm_repair(state)
+
+        assert captured["label"] == "llm_repair"
+        assert "--some.flag=true" in captured["flags"]
+        props = json.loads(captured["env"]["SPRING_APPLICATION_JSON"])
+        assert props["some.custom.property"] == "fixedValue"
+        assert "llm_repair" in state.stubs
+
+    def test_handles_llm_error_gracefully(self, tmp_path):
+        """LLM call failure must not crash the engine — return None."""
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        engine = self._make_engine(tmp_path)
+
+        from asel.runtime import _StartupState
+        from asel.models import ServiceType
+        state = _StartupState(
+            service_type=ServiceType.SPRING_BOOT,
+            jar=tmp_path / "app.jar",
+            host_port=8080, timeout=30, port_flag="--server.port=8080",
+        )
+        state.failure_class = RuntimeFailureClass.UNKNOWN
+        state.log = "some error"
+
+        with patch("asel.runtime._llm_repair_call", side_effect=Exception("API down")):
+            result = engine._attempt_llm_repair(state)
+
+        assert result is None

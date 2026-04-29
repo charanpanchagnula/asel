@@ -1,5 +1,6 @@
 # asel/pipeline.py
 import logging
+import signal
 import subprocess
 import threading
 import uuid
@@ -31,11 +32,33 @@ MAX_TRIES_PER_FINDING = 2    # give up on a finding after this many failed attem
 MAX_BUILD_REPAIR_ATTEMPTS = 2   # how many times to ask the agent to fix its own broken patch
 AGENT_REFRESH_INTERVAL = 15  # create a fresh agent every N iterations to avoid context bloat
 BUILD_AGENT_TIMEOUT_SECONDS = 20 * 60    # 20 min cap per build-agent call
-REMEDIATION_AGENT_TIMEOUT_SECONDS = 5 * 60   # 5 min cap per remediation-agent call
+REMEDIATION_AGENT_TIMEOUT_SECONDS = 9 * 60   # 9 min cap per remediation-agent call
+
+# Per-phase build timeouts — large monorepos (hertzbeat, zipkin, yudao-cloud, mall-swarm)
+# can hang indefinitely if dep:resolve fetches hundreds of artifacts over a slow link.
+DEPENDENCY_RESOLVE_TIMEOUT_SECONDS = 15 * 60   # 15 min
+COMPILE_TIMEOUT_SECONDS = 20 * 60              # 20 min
 
 # Paths excluded from remediation — non-source files the agent can't fix reliably.
-_EXCLUDED_PREFIXES = (".github/", ".gitlab-ci", ".circleci/")
-_EXCLUDED_SUFFIXES = (".tf", ".md", ".adoc", ".rst", ".txt", ".csv", ".sql", ".sh", ".bash")
+_EXCLUDED_PREFIXES = (".github/", ".gitlab-ci", ".circleci/", ".mvn/")
+_EXCLUDED_SUFFIXES = (".tf", ".md", ".adoc", ".rst", ".txt", ".csv", ".sql", ".sh", ".bash", "wrapper/")
+
+# Path segments that signal intentionally-vulnerable code (challenge files, exploit samples, etc.).
+# These are SUB-PATHS within a repo, not whole-repo names — so WebGoat's lessons/ or dvja's
+# controller/ are unaffected.  Only files whose path contains one of these segments are skipped.
+# Rationale for each segment:
+#   challenges/     — wrongsecrets, OWASP challenge suites; each file IS the vulnerability
+#   vulnerable/     — sub-directories explicitly named to hold insecure reference implementations
+#   intentional/    — code that is deliberately insecure by design
+#   exploit-samples/ — sample payloads / PoC code bundled alongside the scanner or app
+#   insecure-examples/ — tutorial directories showing what NOT to do
+_EXCLUDED_SEGMENTS = (
+    "challenges/",
+    "vulnerable/",
+    "intentional/",
+    "exploit-samples/",
+    "insecure-examples/",
+)
 
 _PRIORITY_ORDER = ["critical", "high", "medium", "low", "info"]
 _SCANNER_ORDER = {ScannerType.TRIVY: 0, ScannerType.GITLEAKS: 1, ScannerType.SEMGREP: 2}
@@ -53,6 +76,7 @@ def _is_excluded(file_path: str) -> bool:
     return (
         any(file_path.startswith(p) for p in _EXCLUDED_PREFIXES)
         or any(file_path.endswith(s) for s in _EXCLUDED_SUFFIXES)
+        or any(seg in file_path for seg in _EXCLUDED_SEGMENTS)
     )
 
 
@@ -116,16 +140,49 @@ class PipelineOrchestrator:
         runtime_engine = None
         exploit_engine = None
 
+        # Install signal handlers so that SIGTERM/SIGINT flushes the run-state
+        # before the process exits.  Without this, if the process is killed (e.g.
+        # by an OS OOM reaper, Ctrl-C, or a benchmark runner timeout), the state
+        # file stays at its initial values (status=running, language=null) because
+        # the try/finally block never runs.
+        _orig_sigterm = signal.getsignal(signal.SIGTERM)
+        _orig_sigint  = signal.getsignal(signal.SIGINT)
+
+        def _flush_and_exit(signum, frame):
+            """Best-effort state flush on signal — mark as partial then re-raise."""
+            if state.status == RunStatus.RUNNING:
+                state.status = RunStatus.PARTIAL
+            state.completed_at = state.completed_at or datetime.now(timezone.utc)
+            state.final_finding_count = self._count_by_severity(state.findings)
+            try:
+                self._save(state, run_dir)
+            except Exception:
+                pass
+            # Restore original handler and re-raise so the process exits normally
+            signal.signal(signum, _orig_sigterm if signum == signal.SIGTERM else _orig_sigint)
+            signal.raise_signal(signum)
+
+        signal.signal(signal.SIGTERM, _flush_and_exit)
+        signal.signal(signal.SIGINT, _flush_and_exit)
+
         try:
             # 1. Clone
             _step(f"[bold]Cloning[/bold] {self._config.repo_url}")
-            clone_repo(self._config.repo_url, repo_path)
+            try:
+                clone_repo(self._config.repo_url, repo_path)
+            except RuntimeError as e:
+                _step(f"[red]Clone failed:[/red] {e}")
+                state.status = RunStatus.BUILD_FAILED
+                state.completed_at = datetime.now(timezone.utc)
+                self._save(state, run_dir)
+                return state
             _step("[green]Clone complete[/green]")
 
             # 2. Detect language
             try:
                 language = detect_language(repo_path)
                 state.language = language
+                self._save(state, run_dir)  # persist language before container start (guards against SIGKILL)
             except ValueError as e:
                 _step(f"[red]Unsupported language:[/red] {e}")
                 state.status = RunStatus.UNSUPPORTED_LANGUAGE
@@ -169,7 +226,11 @@ class PipelineOrchestrator:
 
             # 6. Runtime engine — attempt to start the service and confirm it responds
             if runtime_enabled:
-                runtime_engine = RuntimeEngine(repo_path, language, image)
+                runtime_engine = RuntimeEngine(
+                    repo_path, language, image,
+                    llm_model=self._config.llm_model,
+                    llm_provider=self._config.llm_provider,
+                )
                 if runtime_engine.detect():
                     _step("[bold]Runtime engine:[/bold] web service detected — attempting startup...")
                     runtime_result = runtime_engine.start(
@@ -236,12 +297,17 @@ class PipelineOrchestrator:
             baseline_scan_seconds = (datetime.now(timezone.utc) - _scan_start).total_seconds()
             if scanner.had_timeout:
                 _step("[yellow]Warning: one or more scanners timed out on baseline — findings may be incomplete[/yellow]")
+            if scanner.had_failure:
+                _step("[yellow]Warning: one or more scanners hard-failed on baseline — findings may be incomplete[/yellow]")
             _step(f"[bold]Baseline scan:[/bold] {len(findings)} finding(s) ({baseline_scan_seconds/60:.1f}min)")
 
             baseline = IterationSnapshot(
                 iteration=0,
                 findings=findings,
                 build_result=state.build_attempts[-1],
+                scanner_times_secs={k.value: v for k, v in scanner.scanner_times.items()},
+                scanner_had_timeout=scanner.had_timeout,
+                scanner_had_failure=scanner.had_failure,
             )
             state.iterations.append(baseline)
             state.findings = findings
@@ -511,7 +577,7 @@ class PipelineOrchestrator:
         # Step 1: resolve deps (one attempt — if it fails, agent fixes then we move straight to compile)
         if attempt < self._config.max_build_attempts:
             _step(f"  Build attempt {attempt + 1}/{self._config.max_build_attempts} (phase: dependency_resolve)...")
-            result = engine.run_phase(BuildPhase.DEPENDENCY_RESOLVE)
+            result = engine.run_phase(BuildPhase.DEPENDENCY_RESOLVE, timeout_seconds=DEPENDENCY_RESOLVE_TIMEOUT_SECONDS)
             attempt += 1
             state.build_attempts.append(result)
             self._save_build_log(result, str(attempt), run_dir)
@@ -521,7 +587,7 @@ class PipelineOrchestrator:
         # Step 2: compile with agent-assisted retries
         while attempt < self._config.max_build_attempts:
             _step(f"  Build attempt {attempt + 1}/{self._config.max_build_attempts} (phase: compile)...")
-            result = engine.run_phase(BuildPhase.COMPILE)
+            result = engine.run_phase(BuildPhase.COMPILE, timeout_seconds=COMPILE_TIMEOUT_SECONDS)
             attempt += 1
             state.build_attempts.append(result)
             self._save_build_log(result, str(attempt), run_dir)
@@ -693,6 +759,9 @@ class PipelineOrchestrator:
             findings=state.findings,
             build_result=build_result,
             patch_attempt=patch,
+            scanner_times_secs={k.value: v for k, v in rescan.scanner_times.items()},
+            scanner_had_timeout=rescan.had_timeout,
+            scanner_had_failure=rescan.had_failure,
         ))
         return state
 
