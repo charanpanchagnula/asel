@@ -390,27 +390,40 @@ def extract_failing_autoconfigs(log: str, jar_path: Path | None = None) -> list[
     return list(dict.fromkeys(result))  # deduplicate preserving order
 
 
-# ── Recovery action table (Sprint 1 stub — Sprint 2 wires full dispatch) ─────
-# Maps each failure class to an ordered sequence of action names (method names
-# on RuntimeEngine or module-level functions). Actions are applied cumulatively.
-# Currently, only MISSING_PROPERTY / AUTH_BOOTSTRAP / UNKNOWN trigger Attempt 2b
-# (synthesize_config) — the concrete recovery implemented in this sprint.
-# Full dispatch is Sprint 2 work.
+# ── Recovery action table ─────────────────────────────────────────────────────
+# Documents which actions are attempted for each failure class.
+# The actual dispatch loop is _run_startup_attempts; this table serves as the
+# authoritative reference for what is implemented.
+#
+# Implemented actions and where they live:
+#   synthesize_config         → _attempt_config_synthesis (SPRING_APPLICATION_JSON injection)
+#   profile_config_inject     → inside _attempt_config_synthesis (jwt_stub / _scan_profile_configs)
+#   provision_dep_from_log    → _provision_deps_from_log (Docker dep containers)
+#   provision_dep_from_build  → _provision_deps_from_build (static build-file detection)
+#   infra_flags_from_log      → _infra_flags_from_log (Eureka/Vault/Config Server disable)
+#   h2_override               → _attempt_datasource_override
+#   exclude_missing_autoconf  → _attempt_autoconfig_exclude
+#   llm_startup_repair        → _attempt_llm_repair (LLM last-resort, UNKNOWN only)
+#
+# Not yet implemented (future work):
+#   run_openrewrite_security6 — apply OpenRewrite to fix Spring Security 5→6 API migration
+#   extract_nested_jar_resource — unpack WAR/nested JARs for classpath resource access
+#   tomcat_context_xml_inject — inject JNDI datasource binding for WAR apps
 RECOVERY_PLAN: dict[RuntimeFailureClass, list[str]] = {
     RuntimeFailureClass.MISSING_PROPERTY:   ["synthesize_config"],
-    RuntimeFailureClass.AUTH_BOOTSTRAP:     ["expand_security_excludes", "inject_jwt_stub", "synthesize_config"],
+    RuntimeFailureClass.AUTH_BOOTSTRAP:     ["profile_config_inject", "synthesize_config"],
     RuntimeFailureClass.DB_CONNECTION:      ["provision_dep_from_log", "h2_override"],
-    RuntimeFailureClass.DB_SCHEMA:          ["disable_migrations", "h2_override"],
-    RuntimeFailureClass.MISSING_BEAN:       ["detect_api_migration", "exclude_autoconfigure"],
-    RuntimeFailureClass.API_MIGRATION:      ["run_openrewrite_security6"],
-    RuntimeFailureClass.MESSAGING:          ["disable_kafka_listeners", "provision_dep_from_log"],
-    RuntimeFailureClass.EXTERNAL_API:       ["verify_proxy_running", "inject_connect_timeout"],
-    RuntimeFailureClass.RESOURCE_NOT_FOUND: ["extract_nested_jar_resource"],
-    RuntimeFailureClass.TOMCAT_LISTENER:    ["read_tomcat_context_log"],
-    RuntimeFailureClass.BEAN_CREATION:      ["reclassify_from_cause"],
-    RuntimeFailureClass.MISSING_CLASS:      ["exclude_missing_class_autoconfig"],
-    RuntimeFailureClass.MISSING_STATIC:    ["disable_static_resource_bean"],
-    RuntimeFailureClass.NO_MAIN_MANIFEST:  [],  # non-recoverable at runtime; signal to skip
+    RuntimeFailureClass.DB_SCHEMA:          ["h2_override"],
+    RuntimeFailureClass.MISSING_BEAN:       ["exclude_missing_autoconf"],
+    RuntimeFailureClass.API_MIGRATION:      [],   # run_openrewrite_security6 not yet built
+    RuntimeFailureClass.MESSAGING:          ["infra_flags_from_log"],
+    RuntimeFailureClass.EXTERNAL_API:       ["infra_flags_from_log"],
+    RuntimeFailureClass.RESOURCE_NOT_FOUND: [],   # extract_nested_jar_resource not yet built
+    RuntimeFailureClass.TOMCAT_LISTENER:    [],   # tomcat_context_xml_inject not yet built
+    RuntimeFailureClass.BEAN_CREATION:      ["synthesize_config"],
+    RuntimeFailureClass.MISSING_CLASS:      ["exclude_missing_autoconf"],
+    RuntimeFailureClass.MISSING_STATIC:     [],
+    RuntimeFailureClass.NO_MAIN_MANIFEST:   [],
     RuntimeFailureClass.UNKNOWN:            ["llm_startup_repair"],
 }
 
@@ -1774,8 +1787,10 @@ class RuntimeEngine:
         # only surfaces once the datasource is resolved) before attempt 4.
         self._refresh_infra_and_deps(state)
 
-        # Attempt 4: JWT stub — attempt 3 sometimes unmasks an AUTH_BOOTSTRAP failure
-        # (e.g. eladmin's jwt.base64-secret=empty) that was hidden by earlier BeanCreation errors.
+        # Attempt 4: re-run config synthesis with the accumulated state from attempt 3.
+        # Attempt 3 (datasource override) can unmask a new AUTH_BOOTSTRAP or MISSING_PROPERTY
+        # failure that was previously hidden inside a BeanCreationException from the DB failure.
+        # _attempt_config_synthesis checks state.failure_class before acting, so this is safe.
         if result := self._attempt_config_synthesis(state):
             return result
 
