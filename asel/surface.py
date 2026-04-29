@@ -519,8 +519,11 @@ class SurfaceDiscovery:
         ("@RequestMapping", "GET"),   # default method; overridden by method= attr
     ]
 
-    # Regex to extract path value from annotation, e.g. @GetMapping("/api/users/{id}")
-    _PATH_RE = re.compile(r'@\w+Mapping\s*\(\s*(?:value\s*=\s*)?["\{]([^"}\)]+)')
+    # Regex to extract path value from annotation.
+    # Handles both direct strings (@GetMapping("/path")) and array-style
+    # values used in older Spring MVC (@RequestMapping(value={"/path"})),
+    # by grabbing the first double-quoted string anywhere inside the annotation.
+    _PATH_RE = re.compile(r'@\w+Mapping\b[^)]*?"([^"]+)"')
     _METHOD_RE = re.compile(r'method\s*=\s*RequestMethod\.(\w+)')
 
     def _try_source_scan(self) -> Optional[SurfaceDiscoveryResult]:
@@ -573,10 +576,13 @@ class SurfaceDiscovery:
         rel_path = str(src_file.relative_to(self._repo_path))
         endpoints: list[HttpEndpoint] = []
 
-        # Extract class-level base path if present
+        # Extract class-level base path if present.
+        # Guard: only match @RequestMapping that is followed (within ~200 chars) by a
+        # class declaration, so we don't accidentally treat a method-level annotation
+        # as the class prefix. Also handles array-style value={"/path"}.
         class_path = ""
         class_mapping = re.search(
-            r'@RequestMapping\s*\(\s*(?:value\s*=\s*)?["\{]([^"}\)]+)', text
+            r'@RequestMapping\b[^)]*?"([^"]+)"[^{]{0,200}class\s+\w+', text, re.DOTALL
         )
         if class_mapping:
             class_path = "/" + class_mapping.group(1).strip("/")

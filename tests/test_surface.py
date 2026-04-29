@@ -660,3 +660,54 @@ class TestWebXmlDiscovery:
 
         # /login maps to Login.java; /api/* has no source → mapped_to_source == 1
         assert result.mapped_to_source == 1
+
+
+class TestSourceScanArrayStyleAnnotations:
+    """Source scanner must handle older Spring MVC array-style @RequestMapping(value={"/path"})."""
+
+    def _make_disc(self, tmp_path: Path) -> SurfaceDiscovery:
+        with patch("asel.surface.httpx.Client") as mock_client_cls:
+            client = MagicMock()
+            client.get.side_effect = Exception("no server")
+            client.__enter__ = lambda s: s
+            client.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = client
+            return SurfaceDiscovery("http://localhost:8080", tmp_path)
+
+    def test_array_style_value_extracted(self, tmp_path):
+        """@RequestMapping(value={"/login"}) must produce /login, not be skipped."""
+        src = tmp_path / "src" / "main" / "java" / "com" / "example"
+        src.mkdir(parents=True)
+        (src / "AppController.java").write_text(
+            "package com.example;\n"
+            "@Controller\n"
+            "public class AppController {\n"
+            "    @RequestMapping(value={\"/login\"}, method=RequestMethod.GET)\n"
+            "    public String login(Model model) { return \"login\"; }\n"
+            "    @RequestMapping(value={\"/register\"}, method=RequestMethod.POST)\n"
+            "    public String register(Model model) { return \"register\"; }\n"
+            "}\n"
+        )
+        disc = self._make_disc(tmp_path)
+        result = disc.discover()
+        paths = [ep.path for ep in result.endpoints]
+        assert "/login" in paths
+        assert "/register" in paths
+
+    def test_class_level_prefix_not_stolen_by_method_annotation(self, tmp_path):
+        """Class has no @RequestMapping — method annotations must not produce a bogus prefix."""
+        src = tmp_path / "src" / "main" / "java" / "com" / "example"
+        src.mkdir(parents=True)
+        (src / "UserController.java").write_text(
+            "package com.example;\n"
+            "@Controller\n"
+            "public class UserController {\n"
+            "    @GetMapping(\"/users\")\n"
+            "    public String list() { return \"users\"; }\n"
+            "}\n"
+        )
+        disc = self._make_disc(tmp_path)
+        result = disc.discover()
+        paths = [ep.path for ep in result.endpoints]
+        assert "/users" in paths
+        assert any(p == "/users" for p in paths), f"Got paths: {paths}"
