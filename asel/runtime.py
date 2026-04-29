@@ -12,6 +12,7 @@ Usage:
         result = engine.start(timeout_seconds=120)
     engine.stop()  # always call in finally
 """
+import json
 import logging
 import os
 import re
@@ -509,18 +510,7 @@ def _llm_repair_call(log_tail: str, model_id: str, provider: str) -> str:
     Extracted as a module-level function so tests can patch it without touching agno internals.
     """
     from agno.agent import Agent
-
-    def _make_llm(mid: str, prov: str):
-        if prov == "deepseek":
-            from agno.models.deepseek import DeepSeek
-            return DeepSeek(id=mid)
-        if prov == "openai":
-            from agno.models.openai import OpenAIChat
-            return OpenAIChat(id=mid)
-        if prov == "anthropic":
-            from agno.models.anthropic import Claude
-            return Claude(id=mid)
-        raise ValueError(f"Unknown LLM provider: {prov}")
+    from .agents import _make_model
 
     prompt = (
         "A Java Spring Boot application failed to start with the following log:\n\n"
@@ -532,7 +522,7 @@ def _llm_repair_call(log_tail: str, model_id: str, provider: str) -> str:
         '  "reason": one-line explanation\n\n'
         'Example: {"properties": {"some.prop": "val"}, "flags": [], "reason": "app needs some.prop"}'
     )
-    agent = Agent(model=_make_llm(model_id, provider))
+    agent = Agent(model=_make_model(model_id, provider))
     response = agent.run(prompt)
     return response.content if hasattr(response, "content") else str(response)
 
@@ -1657,11 +1647,10 @@ class RuntimeEngine:
         if not synthesized:
             logger.debug("Config synthesis: no unresolved placeholders found — skipping attempt 2b")
             return None
-        import json as _json
         state.stubs.append("config_synthesized")
         return self._try_attempt(
             "config_synthesis", state,
-            extra_env={"SPRING_APPLICATION_JSON": _json.dumps(synthesized)},
+            extra_env={"SPRING_APPLICATION_JSON": json.dumps(synthesized)},
         )
 
     def _attempt_datasource_override(self, state: _StartupState) -> "RuntimeResult | None":
@@ -1702,14 +1691,13 @@ class RuntimeEngine:
             logger.warning("LLM startup repair call failed: %s", exc)
             return None
 
-        import json as _json
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if not m:
             logger.warning("LLM startup repair: response contained no JSON")
             return None
         try:
-            fix = _json.loads(m.group())
-        except _json.JSONDecodeError as exc:
+            fix = json.loads(m.group())
+        except json.JSONDecodeError as exc:
             logger.warning("LLM startup repair: invalid JSON — %s", exc)
             return None
 
@@ -1722,7 +1710,7 @@ class RuntimeEngine:
 
         logger.info("LLM startup repair applying fix: %s  flags=%s  props=%s", reason, flags, list(props))
         state.stubs.append("llm_repair")
-        extra_env = {"SPRING_APPLICATION_JSON": _json.dumps(props)} if props else None
+        extra_env = {"SPRING_APPLICATION_JSON": json.dumps(props)} if props else None
         return self._try_attempt("llm_repair", state, extra_flags=flags or None, extra_env=extra_env)
 
     def _run_startup_attempts(

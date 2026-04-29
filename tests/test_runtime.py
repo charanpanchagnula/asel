@@ -920,3 +920,27 @@ class TestLlmStartupRepair:
             result = engine._attempt_llm_repair(state)
 
         assert result is None
+
+    def test_returns_none_when_llm_suggests_no_changes(self, tmp_path):
+        """When LLM returns empty properties and flags, must return None without modifying stubs."""
+        import json
+        (tmp_path / "pom.xml").write_text("<project></project>")
+        engine = self._make_engine(tmp_path)
+
+        from asel.runtime import _StartupState
+        from asel.models import ServiceType
+        state = _StartupState(
+            service_type=ServiceType.SPRING_BOOT,
+            jar=tmp_path / "app.jar",
+            host_port=8080, timeout=30, port_flag="--server.port=8080",
+        )
+        state.failure_class = RuntimeFailureClass.UNKNOWN
+        state.log = "some error"
+
+        llm_response = json.dumps({"properties": {}, "flags": [], "reason": "nothing to do"})
+
+        with patch("asel.runtime._llm_repair_call", return_value=llm_response):
+            result = engine._attempt_llm_repair(state)
+
+        assert result is None
+        assert "llm_repair" not in state.stubs
