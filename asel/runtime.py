@@ -1614,7 +1614,7 @@ class RuntimeEngine:
                              if k.split(".")[0] not in _BROAD_NS}
             # Override any hardcoded dev secret with a fresh random one.
             extra_profile["jwt.base64-secret"] = _b64.b64encode(_sec.token_hex(32).encode()).decode()
-            synthesized = {**extra_profile, **(synthesized or {})}
+            synthesized = {**(synthesized or {}), **extra_profile}
             logger.info("inject_jwt_stub: injecting profile properties + fresh jwt secret")
         if not synthesized:
             logger.debug("Config synthesis: no unresolved placeholders found — skipping attempt 2b")
