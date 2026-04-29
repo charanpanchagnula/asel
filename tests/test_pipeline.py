@@ -1,8 +1,9 @@
 # tests/test_pipeline.py
+import re
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from asel.pipeline import PipelineOrchestrator, MAX_TRIES_PER_FINDING, MAX_BUILD_REPAIR_ATTEMPTS
+from asel.pipeline import PipelineOrchestrator, MAX_TRIES_PER_FINDING, MAX_BUILD_REPAIR_ATTEMPTS, _compile_still_in_progress
 from asel.models import (
     RunConfig, RunState, RunStatus, BuildResult, BuildPhase,
     ScanFinding, ScannerType, Severity, Language, IterationSnapshot,
@@ -157,6 +158,7 @@ def test_patch_rolled_back_when_net_negative(tmp_path):
             + [[original_finding, new_finding]] * MAX_TRIES_PER_FINDING  # each re-scan
         )
         mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.had_failure = False
         mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
@@ -187,6 +189,7 @@ def test_converges_when_finding_fixed(tmp_path):
             [],         # after patch: finding gone
         ]
         mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.had_failure = False
         mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
@@ -219,6 +222,7 @@ def test_skips_stuck_finding_and_moves_on(tmp_path):
             [stuck],                   # iter 3: fixable resolved
         ]
         mock_scanner_cls.return_value.had_timeout = False
+        mock_scanner_cls.return_value.had_failure = False
         mock_scanner_cls.return_value.scanner_times = {}
         orchestrator = PipelineOrchestrator(cfg)
         state = orchestrator.run()
@@ -287,3 +291,17 @@ def test_run_passes_language_to_build_agent(tmp_path):
         PipelineOrchestrator(cfg).run()
     _, kwargs = mock_cba.call_args
     assert kwargs.get("language") == Language.JAVA_GRADLE
+
+
+def test_compile_still_in_progress_detects_active_compile():
+    output = "[INFO] Building hertzbeat-manager 2.0-SNAPSHOT\n[INFO] --- compiler:3.13.0:compile ---\n"
+    assert _compile_still_in_progress(output) is True
+
+
+def test_compile_still_in_progress_false_on_failure_output():
+    output = "[ERROR] BUILD FAILURE\n[ERROR] Failed to execute goal\n"
+    assert _compile_still_in_progress(output) is False
+
+
+def test_compile_still_in_progress_false_on_empty():
+    assert _compile_still_in_progress("") is False

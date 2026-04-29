@@ -1,5 +1,6 @@
 # asel/pipeline.py
 import logging
+import re
 import signal
 import subprocess
 import threading
@@ -38,6 +39,23 @@ REMEDIATION_AGENT_TIMEOUT_SECONDS = 9 * 60   # 9 min cap per remediation-agent c
 # can hang indefinitely if dep:resolve fetches hundreds of artifacts over a slow link.
 DEPENDENCY_RESOLVE_TIMEOUT_SECONDS = 15 * 60   # 15 min
 COMPILE_TIMEOUT_SECONDS = 20 * 60              # 20 min
+# When compile times out and output still shows active Maven/Gradle progress,
+# grant one extension of this fraction of the original timeout before giving up.
+COMPILE_TIMEOUT_EXTENSION_FACTOR = 0.5   # 50% extension → 30 min total for a 20-min base
+
+_COMPILE_PROGRESS_RE = re.compile(
+    r"\[INFO\] Building |\[INFO\] --- .*:compile|Compiling \d+ source",
+    re.IGNORECASE,
+)
+
+
+def _compile_still_in_progress(output: str) -> bool:
+    """Return True if the last 50 lines of compile output show active Maven/Gradle progress."""
+    if not output:
+        return False
+    tail = "\n".join(output.splitlines()[-50:])
+    return bool(_COMPILE_PROGRESS_RE.search(tail))
+
 
 # Paths excluded from remediation — non-source files the agent can't fix reliably.
 _EXCLUDED_PREFIXES = (".github/", ".gitlab-ci", ".circleci/", ".mvn/")
@@ -584,7 +602,8 @@ class PipelineOrchestrator:
             if not result.success:
                 _agent_fix(result, "dependency_resolve")
 
-        # Step 2: compile with agent-assisted retries
+        # Step 2: compile with agent-assisted retries and one progress-based timeout extension.
+        extended = False
         while attempt < self._config.max_build_attempts:
             _step(f"  Build attempt {attempt + 1}/{self._config.max_build_attempts} (phase: compile)...")
             result = engine.run_phase(BuildPhase.COMPILE, timeout_seconds=COMPILE_TIMEOUT_SECONDS)
@@ -593,6 +612,20 @@ class PipelineOrchestrator:
             self._save_build_log(result, str(attempt), run_dir)
             if result.success:
                 return True
+            # If compile timed out and is still making progress, grant one extension.
+            if (not result.success and not extended
+                    and result.error_category is None
+                    and _compile_still_in_progress(result.output)):
+                extension = int(COMPILE_TIMEOUT_SECONDS * COMPILE_TIMEOUT_EXTENSION_FACTOR)
+                _step(f"  Compile still in progress — extending timeout by {extension // 60}m")
+                extended = True
+                ext_result = engine.run_phase(BuildPhase.COMPILE, timeout_seconds=extension)
+                attempt += 1
+                state.build_attempts.append(ext_result)
+                self._save_build_log(ext_result, str(attempt), run_dir)
+                if ext_result.success:
+                    return True
+                result = ext_result
             _agent_fix(result, "compile")
 
         return False
