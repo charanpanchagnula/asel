@@ -645,6 +645,24 @@ infra_overrides:
     flags:
       - "--spring.kafka.listener.auto-startup=false"
 
+  # Redis: app sends a password but the provisioned Redis has no auth configured.
+  # Covers Spring Data Redis, Redisson Spring Boot Starter (reads spring.redis.*),
+  # and the Redisson-native config file path (spring.redis.redisson.config='' forces
+  # fallback to Spring properties, which we then clear).
+  - pattern: "ERR AUTH.*called without any password configured|WRONGPASS invalid username-password pair"
+    flags:
+      - "--spring.redis.password="
+      - "--spring.data.redis.password="
+      - "--spring.redis.redisson.config="
+      - "--spring.redis.redisson.single-server-config.password="
+
+  # MaxMind GeoLite2 database file missing from classpath — typically embedded in
+  # an IP-geolocation bean that reads a .mmdb file at startup. Best-effort disable.
+  - pattern: "GeoLite2-City\\.mmdb|maxmind.*cannot be resolved|DatabaseReader.*class path"
+    flags:
+      - "--spring.geolocation.enabled=false"
+      - "--geolocation.maxmind.enabled=false"
+
   # OAuth2 / OIDC resource server trying to fetch provider metadata from an
   # issuer-uri or jwk-set-uri that is unreachable in ASEL's environment.
   # Excluding the autoconfigure classes prevents Spring Security from aborting
@@ -652,3 +670,11 @@ infra_overrides:
   - pattern: "issuer-uri|jwk-set-uri|oidcProviderConfiguration|OAuth2.*authorization.server|ConnectException.*oauth|Unable to resolve.*OpenID"
     flags:
       - "--spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.security.oauth2.resource.servlet.OAuth2ResourceServerAutoConfiguration,org.springframework.boot.autoconfigure.security.oauth2.client.servlet.OAuth2ClientAutoConfiguration"
+
+  # Zipkin Lens UI (and similar bundled SPA assets) not present on classpath —
+  # typically happens when building zipkin-server without the zipkin-lens module,
+  # or when the UI JAR is not included in the fat JAR assembly.
+  # Setting zipkin.ui.enabled=false skips the ZipkinUiConfiguration bean entirely.
+  - pattern: "Could not load Lens UI|zipkin-lens|ZipkinUiConfiguration"
+    flags:
+      - "--zipkin.ui.enabled=false"

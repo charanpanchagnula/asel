@@ -38,13 +38,22 @@ _DETECTORS: list[tuple] = [
 ]
 
 
-def clone_repo(url: str, dest: Path) -> Path:
-    """Clone a git repo (shallow) to dest. Raises RuntimeError on failure."""
-    result = subprocess.run(
-        ["git", "clone", "--depth=1", url, str(dest)],
-        capture_output=True,
-        text=True,
-    )
+CLONE_TIMEOUT_SECONDS = 600  # 10 min — large monorepos (hertzbeat, zipkin, yudao-cloud) need time
+
+
+def clone_repo(url: str, dest: Path, timeout: int = CLONE_TIMEOUT_SECONDS) -> Path:
+    """Clone a git repo (shallow) to dest. Raises RuntimeError on failure or timeout."""
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", url, str(dest)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"git clone timed out after {timeout}s — repo may be too large or network too slow: {url}"
+        )
     if result.returncode != 0:
         raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
     return dest

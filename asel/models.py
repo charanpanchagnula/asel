@@ -86,6 +86,8 @@ class RuntimeFailureClass(str, Enum):
     DB_SCHEMA          = "db_schema"            # Flyway/Liquibase schema validation fails
     MESSAGING          = "messaging"            # Kafka/RabbitMQ broker unavailable
     MISSING_CLASS      = "missing_class"        # NoClassDefFoundError / ClassNotFoundException in bean init
+    MISSING_STATIC     = "missing_static"       # Static classpath resource missing at startup (e.g. UI assets)
+    NO_MAIN_MANIFEST   = "no_main_manifest"     # JAR has no Main-Class in MANIFEST.MF
     UNKNOWN            = "unknown"
 
 
@@ -228,6 +230,9 @@ class IterationSnapshot(BaseModel):
     findings: list[ScanFinding]
     build_result: BuildResult
     patch_attempt: Optional[PatchAttempt] = None
+    scanner_times_secs: dict[str, float] = {}   # scanner name → elapsed seconds
+    scanner_had_timeout: bool = False            # True if any scanner timed out
+    scanner_had_failure: bool = False            # True if any scanner hard-failed
 
 
 class ProbeStatus(str, Enum):

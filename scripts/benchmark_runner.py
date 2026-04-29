@@ -40,12 +40,16 @@ REPOS_FILE = ASEL_ROOT / "benchmark_repos.yaml"
 # ---------------------------------------------------------------------------
 # Format: (url, build_tool, short_name, tier)
 
-def _load_repos() -> list[tuple[str, str, str, int]]:
-    """Load repo list from benchmark_repos.yaml."""
+def _load_repos() -> list[tuple[str, str, str, int, int]]:
+    """Load repo list from benchmark_repos.yaml.
+
+    Returns (url, build_tool, short_name, tier, max_runtime_minutes).
+    max_runtime_minutes is 0 when not set in yaml (caller falls back to --max-runtime arg).
+    """
     if yaml is None:
         raise SystemExit("PyYAML not installed. Run: uv add pyyaml")
     data = yaml.safe_load(REPOS_FILE.read_text())
-    return [(r["url"], r["build"], r["name"], r["tier"]) for r in data["repos"]]
+    return [(r["url"], r["build"], r["name"], r["tier"], r.get("max_runtime_minutes", 0)) for r in data["repos"]]
 
 BENCHMARK_REPOS = _load_repos()
 
@@ -77,12 +81,13 @@ def _latest_run_id() -> str | None:
     return max(dirs, key=lambda d: d.stat().st_mtime).name
 
 
-def _run_asel(repo_url: str, max_findings: int, max_runtime: int, model: str, provider: str) -> tuple[bool, str | None]:
+def _run_asel(repo_url: str, max_findings: int, max_runtime: int, model: str, provider: str, *, per_repo_runtime: int = 0) -> tuple[bool, str | None]:
     """Run asel and return (success, run_id)."""
+    effective_runtime = per_repo_runtime if per_repo_runtime > 0 else max_runtime
     cmd = [
         "uv", "run", "asel", repo_url,
         "--max-findings-to-remediate", str(max_findings),
-        "--max-runtime-minutes", str(max_runtime),
+        "--max-runtime-minutes", str(effective_runtime),
         "--model", model,
         "--provider", provider,
     ]
@@ -135,7 +140,7 @@ def main() -> None:
     print(f"\nASEL Benchmark Runner — {session_start.strftime('%Y-%m-%d %H:%M')} UTC")
     print(f"Tier: {args.tier} | Repos: {len(repos)} | Max findings: {args.max_findings} | Max runtime: {args.max_runtime}m\n")
 
-    for url, build_tool, name, tier in repos:
+    for url, build_tool, name, tier, repo_max_runtime in repos:
         print(f"{'='*60}")
         print(f"Repo: {name} ({build_tool}, tier {tier})")
         print(f"URL:  {url}")
@@ -146,14 +151,15 @@ def main() -> None:
             session_log.append({"repo": name, "url": url, "skipped": True, "existing_run": existing})
             continue
 
+        effective_runtime = repo_max_runtime if repo_max_runtime > 0 else args.max_runtime
         if args.dry_run:
-            print(f"  [dry-run] would run: uv run asel {url} --max-findings-to-remediate {args.max_findings} --max-runtime-minutes {args.max_runtime}")
+            print(f"  [dry-run] would run: uv run asel {url} --max-findings-to-remediate {args.max_findings} --max-runtime-minutes {effective_runtime}")
             continue
 
         t_start = time.monotonic()
         print(f"  Starting at {datetime.now().strftime('%H:%M:%S')}...")
 
-        ok, run_id = _run_asel(url, args.max_findings, args.max_runtime, args.model, args.provider)
+        ok, run_id = _run_asel(url, args.max_findings, args.max_runtime, args.model, args.provider, per_repo_runtime=repo_max_runtime)
 
         elapsed = round((time.monotonic() - t_start) / 60, 1)
         print(f"  Finished in {elapsed}m — run_id: {run_id}")

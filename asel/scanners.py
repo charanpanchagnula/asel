@@ -48,7 +48,10 @@ class BaseScanner(ABC):
         ...
 
 
-_SEMGREP_TIMEOUT_SECS = 600  # 10-minute hard cap per scan
+_SEMGREP_TIMEOUT_SECS = 1800  # 30-minute hard cap — large monorepos (e.g. mall-swarm) need >10min
+_SEMGREP_LARGE_REPO_THRESHOLD = 500  # Java source files above this → "large" tuning
+_SEMGREP_PER_RULE_TIMEOUT_SMALL = 30   # seconds per rule per file — small repos
+_SEMGREP_PER_RULE_TIMEOUT_LARGE = 60   # seconds per rule per file — large monorepos
 
 # Map Language values to focused semgrep rule packs — avoids downloading and running
 # rules for irrelevant languages (e.g. Python/JS rules against a Java repo).
@@ -65,18 +68,35 @@ class SemgrepScanner(BaseScanner):
     def __init__(self, language: str | None = None):
         self._config = _SEMGREP_CONFIG.get(language or "", _SEMGREP_CONFIG_DEFAULT)
 
+    @staticmethod
+    def _count_source_files(repo_path: Path) -> int:
+        """Count Java/Kotlin/Groovy source files to detect large monorepos."""
+        try:
+            return sum(1 for _ in repo_path.rglob("*.java")) + \
+                   sum(1 for _ in repo_path.rglob("*.kt"))
+        except Exception:
+            return 0
+
     def run(self, repo_path: Path) -> list[ScanFinding]:
         client = docker.from_env()
         container = None
         timed_out = threading.Event()
+
+        # Scale per-rule timeout based on repo size to avoid mass file-skipping
+        # on large monorepos while keeping fast scans fast.
+        n_files = self._count_source_files(repo_path)
+        is_large = n_files >= _SEMGREP_LARGE_REPO_THRESHOLD
+        per_rule_timeout = _SEMGREP_PER_RULE_TIMEOUT_LARGE if is_large else _SEMGREP_PER_RULE_TIMEOUT_SMALL
+        if is_large:
+            logger.info("Semgrep: large repo detected (%d source files) — using %ds per-rule timeout", n_files, per_rule_timeout)
 
         try:
             container = client.containers.run(
                 "semgrep/semgrep:latest",
                 command=[
                     "semgrep", "scan", f"--config={self._config}", "--json",
-                    "--timeout", "30",           # max seconds per rule per file
-                    "--timeout-threshold", "3",  # skip file after 3 rule timeouts
+                    "--timeout", str(per_rule_timeout),  # max seconds per rule per file
+                    "--timeout-threshold", "3",           # skip file after 3 rule timeouts
                     "/src",
                 ],
                 volumes={str(repo_path.resolve()): {"bind": "/src", "mode": "ro"}},

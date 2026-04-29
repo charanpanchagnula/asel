@@ -28,6 +28,7 @@ repos:
     build: maven
     name: wrongsecrets
     tier: 1
+    max_runtime_minutes: 90
 
   - url: https://github.com/appsecco/dvja
     build: maven
@@ -168,21 +169,25 @@ repos:
     build: maven
     name: mall-swarm
     tier: 2
+    max_runtime_minutes: 180
 
   - url: https://github.com/dromara/hertzbeat
     build: maven
     name: hertzbeat
     tier: 2
+    max_runtime_minutes: 120
 
   - url: https://github.com/openzipkin/zipkin
     build: maven
     name: zipkin
     tier: 2
+    max_runtime_minutes: 180
 
   - url: https://github.com/YunaiV/yudao-cloud
     build: maven
     name: yudao-cloud
     tier: 2
+    max_runtime_minutes: 180
 
   # stratospheric: monorepo — Spring Boot app is in application/ subdir.
   # Needs ingestor subdir support before it can run.

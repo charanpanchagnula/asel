@@ -356,15 +356,19 @@ class TestDiscoveryFallback:
         with patch("asel.surface.httpx.Client", MagicMock(return_value=client)):
             result = disc.discover()
 
-        assert result.discovery_source == "none"
-        assert result.endpoints == []
+        # The disc fixture has a repo with Spring annotations; when HTTP strategies fail,
+        # _try_source_scan succeeds and returns "source_scan" instead of "none".
+        assert result.discovery_source == "source_scan"
+        assert len(result.endpoints) > 0
 
     def test_returns_none_source_on_all_404(self, disc):
         with patch("asel.surface.httpx.Client",
                    _mock_http_sequence(*[(404, {})] * 6)):
             result = disc.discover()
 
-        assert result.discovery_source == "none"
+        # The disc fixture has a repo with Spring annotations; when HTTP strategies fail,
+        # _try_source_scan succeeds and returns "source_scan" instead of "none".
+        assert result.discovery_source == "source_scan"
 
 
 # ── Source file resolution ────────────────────────────────────────────────────
@@ -632,7 +636,7 @@ class TestWebXmlDiscovery:
         assert result.discovery_source == "actuator"
 
     def test_no_web_xml_returns_none(self, disc):
-        """Repo without web.xml falls through to 'none'."""
+        """Repo without web.xml falls through to source_scan (the disc fixture has Spring annotations)."""
         import httpx as httpx_module
         client = MagicMock()
         client.get.side_effect = httpx_module.ConnectError("refused")
@@ -641,7 +645,9 @@ class TestWebXmlDiscovery:
         with patch("asel.surface.httpx.Client", MagicMock(return_value=client)):
             result = disc.discover()
 
-        assert result.discovery_source == "none"
+        # disc fixture has a UserController.java with @GetMapping/@PostMapping;
+        # _try_source_scan finds those annotations, so source_scan takes precedence over "none".
+        assert result.discovery_source == "source_scan"
 
     def test_mapped_to_source_count(self, servlet_disc):
         import httpx as httpx_module
