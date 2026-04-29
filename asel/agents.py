@@ -69,7 +69,7 @@ def _make_file_tools(repo_path: Path) -> list:
             return f"Blocked: {path} escapes the repository boundary"
         if not full.exists():
             return f"File not found: {path}"
-        content = full.read_text()
+        content = full.read_text(errors="replace")
         # Accept either start_line/end_line or start/end aliases
         sl = start_line or start
         el = end_line or end
@@ -105,7 +105,7 @@ def _make_file_tools(repo_path: Path) -> list:
             return f"Blocked: {path} escapes the repository boundary"
         if not full.exists():
             return f"File not found: {path}"
-        content = full.read_text()
+        content = full.read_text(errors="replace")
         if old_text not in content:
             return f"Text not found in {path} — check for whitespace differences"
         full.write_text(content.replace(old_text, new_text, 1))
@@ -137,7 +137,7 @@ def _make_file_tools(repo_path: Path) -> list:
             return f"File not found: {path}"
         if full.is_dir():
             return f"Path is a directory: {path} — provide a specific file path"
-        lines = full.read_text().splitlines()
+        lines = full.read_text(errors="replace").splitlines()
         try:
             re.compile(pattern)
             def _matches(line: str) -> bool:

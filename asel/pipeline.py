@@ -678,7 +678,7 @@ class PipelineOrchestrator:
         rep = targets[0]
 
         self._snapshot_repo(repo_path)
-        prompt = self._remediation_prompt(targets, iteration, language)
+        prompt = self._remediation_prompt(targets, iteration, language, state.probe_results)
         try:
             run_output = _run_agent_with_timeout(remediation_agent, prompt, REMEDIATION_AGENT_TIMEOUT_SECONDS)
         except Exception as exc:
@@ -808,7 +808,7 @@ class PipelineOrchestrator:
             "Please fix the issue and verify by running Maven."
         )
 
-    def _remediation_prompt(self, targets: list[ScanFinding], iteration: int, language: Language) -> str:
+    def _remediation_prompt(self, targets: list[ScanFinding], iteration: int, language: Language, probe_results: list['ProbeResult'] = None) -> str:
         verify_tool = (
             "run_gradle_compile" if language == Language.JAVA_GRADLE else "run_maven_compile"
         )
@@ -836,11 +836,28 @@ class PipelineOrchestrator:
                 desc += "..."
             description_note = f"\n  Description: {desc}"
 
+        probe_info = ""
+        if probe_results:
+            target_ids = {t.id for t in targets}
+            for pr in probe_results:
+                if pr.finding_id in target_ids and pr.status.value == "exploitable":
+                    probe_info = (
+                        f"\n\n[!] EXPLOIT CONFIRMED BY AGENTIC DAST\n"
+                        f"An autonomous pentester successfully exploited this vulnerability.\n"
+                        f"Endpoint: {pr.endpoint.method} {pr.endpoint.path}\n"
+                        f"Payload sent: {pr.request}\n"
+                        f"Evidence: {pr.evidence}\n"
+                        f"You must patch this to prevent the exploit.\n"
+                        f"After you patch, the exact same payload will be re-sent to verify your fix."
+                    )
+                    break
+
         return (
             f"Remediation iteration {iteration}. Fix this finding{count_note}:\n\n"
             f"  [{rep.severity.value.upper()}] {rep.rule_id}\n"
             + location
             + description_note
+            + probe_info
             + f"\n\nRead the file first, apply the minimal fix to all instances, "
             + f"then optionally verify with {verify_tool}."
         )
